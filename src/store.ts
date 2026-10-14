@@ -4,7 +4,7 @@ import type { ChatMessage, Day, MapRegion, PlanItem, Settings, Spot, Trip, TripS
 import { makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays } from './lib/tripOps';
 
 export const DEFAULT_SETTINGS: Settings = {
-  provider: 'claude',
+  provider: 'relay',
   claudeKey: '',
   claudeModel: 'claude-opus-5-5',
   openaiKey: '',
@@ -200,10 +200,12 @@ export const useStore = create<State>()(
         appendChat: (msg) =>
           mutate((t) => {
             const chat = [...t.chat, msg];
-            // Drop undo snapshots from older turns.
-            let kept = 0;
+            // Drop undo / relay-start snapshots from older turns.
+            let undos = 0;
+            let starts = 0;
             for (let i = chat.length - 1; i >= 0; i--) {
-              if (chat[i].undo && ++kept > UNDO_KEEP) chat[i] = { ...chat[i], undo: undefined };
+              if (chat[i].undo && ++undos > UNDO_KEEP) chat[i] = { ...chat[i], undo: undefined };
+              if (chat[i].relayStart && ++starts > UNDO_KEEP) chat[i] = { ...chat[i], relayStart: undefined };
             }
             return { ...t, chat };
           }),
