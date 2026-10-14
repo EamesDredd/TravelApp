@@ -106,6 +106,24 @@ describe('add_candidates / update_spots / update_trip', () => {
     expect(r.trip.spots[2]).toMatchObject({ category: 'meal', note: '拿鐵', lat: 35.0 });
   });
 
+  it('accepts numeric strings, ignores deleting a missing place and reports empty updates', () => {
+    const r = applyToolCall(sample(), 'update_spots', {
+      updates: [
+        { spot_id: 's_kiyo', duration_min: '90' },
+        { spot_id: 's_gone', delete: 'true' },
+        { spot_id: 's_inar', lat: 35 },
+        { spot_id: 's_cafe' },
+        'oops',
+      ],
+    });
+    expect(r.trip.spots[0].durationMin).toBe(90);
+    expect(r.result).toContain('s_gone 已不存在');
+    expect(r.result).toContain('錯誤：s_inar 的座標要同時提供 lat 和 lng');
+    expect(r.result).toContain('錯誤：s_cafe 沒有可以更新的欄位');
+    expect(r.result).toContain('錯誤：updates 的項目格式錯誤');
+    expect(applyToolCall(sample(), 'update_trip', { day_count: '4' }).trip.days).toHaveLength(4);
+  });
+
   it('changes the day count and start date', () => {
     const r = applyToolCall(sample(), 'update_trip', { day_count: 4, start_date: '2026-11-01' });
     expect(r.trip.days).toHaveLength(4);

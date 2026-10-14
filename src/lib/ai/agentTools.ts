@@ -211,7 +211,12 @@ type Obj = Record<string, unknown>;
 
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
-const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+/** Numbers, also accepting numeric strings ("90"), which hand-written JSON often contains. */
+const num = (v: unknown): number | undefined => {
+  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
+  return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
+};
+const isTrue = (v: unknown) => v === true || v === 'true';
 
 function readSpotFields(o: Obj): { fields?: Omit<Spot, 'id'>; error?: string } {
   const name = str(o.name);
@@ -375,14 +380,19 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
   let deleted = 0;
   let edited = 0;
   for (const raw of input.updates) {
-    if (!isObj(raw)) continue;
+    if (!isObj(raw)) {
+      errors.push('updates 的項目格式錯誤');
+      continue;
+    }
     const id = str(raw.spot_id);
     const spot = next.spots.find((s) => s.id === id);
     if (!spot) {
-      errors.push(`找不到 spot_id ${String(raw.spot_id)}`);
+      // Deleting something already gone is not a problem worth reporting.
+      if (isTrue(raw.delete)) done.push(`${String(raw.spot_id)} 已不存在`);
+      else errors.push(`找不到 spot_id ${String(raw.spot_id)}`);
       continue;
     }
-    if (raw.delete === true) {
+    if (isTrue(raw.delete)) {
       next = {
         ...next,
         spots: next.spots.filter((s) => s.id !== id),
@@ -409,9 +419,15 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
     if (lat !== undefined && lng !== undefined) {
       patch.lat = lat;
       patch.lng = lng;
+    } else if (lat !== undefined || lng !== undefined) {
+      errors.push(`${id} 的座標要同時提供 lat 和 lng`);
     }
     const dur = num(raw.duration_min);
     if (dur !== undefined) patch.durationMin = dur > 0 ? Math.round(dur) : undefined;
+    if (!Object.keys(patch).length) {
+      errors.push(`${id} 沒有可以更新的欄位`);
+      continue;
+    }
     next = { ...next, spots: next.spots.map((s) => (s.id === id ? { ...s, ...patch } : s)) };
     edited++;
     done.push(`已更新 ${id} ${patch.name ?? spot.name}`);

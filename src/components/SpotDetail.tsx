@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive, spotSearchPrompt } from '../lib/ai';
-import { buildRelaySearchPrompt, extractSources, looksLikeOwnPrompt } from '../lib/ai/relay';
+import { buildRelaySearchPrompt, extractSources, looksLikeOwnPrompt, parseRelayReply } from '../lib/ai/relay';
 import { copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { hasCoords, spotRegion } from '../lib/geo';
 import { placeQuery, quickSearchLinks } from '../lib/maps';
@@ -172,8 +172,18 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
     }
     const summary = text.replace(/\r\n?/g, '\n').trim();
     if (!summary) return;
-    const replace = spot.search ? '（會取代原本的查詢結果）' : '';
-    if (!confirm(`把這段內容存成「${spot.name}」的查詢結果嗎？${replace}\n\n${preview(summary)}`)) return;
+    const asPlan = parseRelayReply(summary);
+    if (asPlan.ops || asPlan.problems.length) {
+      toast('這是行程修改的回覆，請到 AI 討論按「📋 貼上回覆」');
+      return;
+    }
+    const notes = [
+      spot.search ? '會取代原本的查詢結果。' : '',
+      summary.includes(spot.name) ? '' : `內容裡沒有提到「${spot.name}」，確定是這個地點的結果嗎？`,
+    ].filter(Boolean);
+    if (!confirm(`把這段內容存成「${spot.name}」的查詢結果嗎？${notes.length ? `\n${notes.join('\n')}` : ''}\n\n${preview(summary)}`)) {
+      return;
+    }
     updateSpot(spot.id, {
       search: { summary, sources: extractSources(summary), provider: 'Claude / ChatGPT App', at: Date.now() },
     });

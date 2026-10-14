@@ -77,6 +77,10 @@ export interface ChatMessage {
   relayOps?: string;
   /** Message the user can send back to the AI to fix problems in its block. */
   relayFix?: string;
+  /** Block version (rev) this reply carried. */
+  relayRev?: number;
+  /** A later reply to the same request replaced this one. */
+  superseded?: boolean;
   at: number;
 }
 

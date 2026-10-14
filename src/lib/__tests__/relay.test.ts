@@ -40,18 +40,42 @@ const block = (obj: unknown) => '```travelplan\n' + JSON.stringify(obj, null, 2)
 const day = (n: number, ...ids: string[]) => ({ day: n, items: ids.map((id) => ({ spot_id: id })) });
 const plan = (base: string | undefined, ...days: object[]) =>
   `好的。\n\n${block({ ...(base ? { base } : {}), ops: [{ tool: 'set_day_plans', input: { days } }] })}`;
+const planRev = (base: string, rev: number, ...days: object[]) =>
+  `好的。\n\n${block({ base, rev, ops: [{ tool: 'set_day_plans', input: { days } }] })}`;
 
 /** Mirrors what ChatPanel commits for an accepted 'apply' decision. */
 function commit(t: Trip, d: RelayDecision): Trip {
   if (d.kind !== 'apply') throw new Error(`expected apply, got ${d.kind}`);
   const resultFp = tripFingerprint(d.result.trip);
+  const chat = t.chat.map((m) => (m.id === d.replaces ? { ...m, superseded: true } : m));
   return {
     ...t,
     ...d.result.trip,
     chat: [
-      ...t.chat,
-      { id: `a${t.chat.length}`, role: 'assistant', text: '', at: 0, relayBase: d.parsed.base, relayResult: resultFp, relayOps: d.opsFp, undo: d.before },
+      ...chat,
+      {
+        id: `a${t.chat.length}`,
+        role: 'assistant',
+        text: '',
+        at: 0,
+        relayBase: d.parsed.base,
+        relayRev: d.parsed.rev,
+        relayResult: resultFp,
+        relayOps: d.opsFp,
+        undo: d.before,
+      },
     ],
+  };
+}
+
+/** Mirrors ChatPanel's undo: restore the snapshot and retire this and every later undo point. */
+function undoAt(t: Trip, id: string): Trip {
+  const idx = t.chat.findIndex((m) => m.id === id);
+  const snap = t.chat[idx].undo!;
+  return {
+    ...t,
+    ...snap,
+    chat: t.chat.map((m, i) => (i >= idx && m.undo ? { ...m, undo: undefined, undone: true } : m)),
   };
 }
 
@@ -84,8 +108,8 @@ describe('outgoing messages', () => {
     expect(p.startsWith(RELAY_MARKER)).toBe(true);
     expect(p).toContain('## 我的需求\n幫我按遠近排\n');
     expect(p).toContain('"base" 固定寫 "abc123"');
-    expect(p).toContain('```travelplan\n{"base":"abc123","ops":[');
-    expect(p).toContain('只要列出「這次要做的修改」');
+    expect(p).toContain('```travelplan\n{"base":"abc123","rev":1,"ops":[');
+    expect(p).toContain('列出這個請求「全部」的修改');
     for (const t of ['add_candidates', 'set_day_plans', 'update_spots', 'update_trip']) expect(p).toContain(`### ${t}`);
     expect(p).toContain('s_kiyo | 景點 | 清水寺 | 34.99490,135.78500');
   });
@@ -129,10 +153,37 @@ describe('parseRelayReply', () => {
   });
 
   it('never falls back to an earlier block when the latest one is cut off', () => {
-    const first = [{ tool: 'update_trip', input: { name: '舊' } }];
-    const r = parseRelayReply(`${block({ base: 'b', ops: first })}\n修正：\n\`\`\`travelplan\n{"base":"b","ops":[{"tool":"set_day`);
+    const first = JSON.stringify({ base: 'b', ops: [{ tool: 'update_trip', input: { name: '舊' } }] });
+    const cut = '{"base":"b","ops":[{"tool":"set_day';
+    const variants = [
+      `\`\`\`travelplan\n${first}\n\`\`\`\n修正：\n\`\`\`travelplan\n${cut}`,
+      `\`\`\`json\n${first}\n\`\`\`\n修正：\n\`\`\`json\n${cut}`,
+      `travelplan\n複製程式碼\n${first}\n修正：\ntravelplan\n複製程式碼\n${cut}`,
+      `\`\`\`TravelPlan\n${first}\n\`\`\`\n修正：\n\`\`\`TravelPlan\n`,
+    ];
+    for (const v of variants) {
+      const r = parseRelayReply(v);
+      expect(r.ops, v).toBeNull();
+      expect(r.problems.join(), v).toContain('不完整');
+    }
+  });
+
+  it('reports a lone cut-off block copied without fences', () => {
+    const r = parseRelayReply('說明\ntravelplan\n{"base":"b","ops":[{"tool":"set_day_plans"');
     expect(r.ops).toBeNull();
     expect(r.problems.join()).toContain('不完整');
+  });
+
+  it('reports a block without an ops list', () => {
+    const r = parseRelayReply(block({ base: 'b', ops: { tool: 'update_trip' } }));
+    expect(r.ops).toBeNull();
+    expect(r.problems.join()).toContain('ops');
+  });
+
+  it('reads the block version', () => {
+    expect(parseRelayReply(block({ base: 'b', rev: 3, ops })).rev).toBe(3);
+    expect(parseRelayReply(block({ base: 'b', rev: '2', ops })).rev).toBe(2);
+    expect(parseRelayReply(block({ base: 'b', ops })).rev).toBeUndefined();
   });
 
   it('ignores braces inside strings and other code blocks', () => {
@@ -175,6 +226,14 @@ describe('applyRelayOps', () => {
     expect(r.trip.days[3].items[0].spotId).toBe(added[0].id);
     expect(r.errors).toEqual(['找不到 spot_id s_nope']);
   });
+
+  it('does not count reused places as problems, and deleting a missing place is fine', () => {
+    const r = applyRelayOps(sample(), [
+      { tool: 'add_candidates', input: { spots: [{ name: '清水寺', category: 'sight' }, { name: '無類別' }] } },
+      { tool: 'update_spots', input: { updates: [{ spot_id: 's_gone', delete: true }] } },
+    ]);
+    expect(r.errors).toEqual(['「無類別」的 category 必須是 sight / breakfast / meal']);
+  });
 });
 
 describe('planRelayApply', () => {
@@ -193,21 +252,61 @@ describe('planRelayApply', () => {
     expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar'], []]);
   });
 
-  it('builds a follow-up reply on top of the earlier one instead of reverting it', () => {
+  it('a newer reply to the same request replaces the earlier one', () => {
     let t = sent(trip(), 'tag001');
-    t = commit(t, planRelayApply(plan('tag001', day(1, 's_kiyo'), day(3, 's_kink')), t, []));
-    const d = planRelayApply(plan('tag001', day(2, 's_inar', 's_kink')), t, []);
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo'), day(3, 's_kink')), t, []));
+    // rev 2 keeps day 1, drops the day-3 idea and adds day 2.
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo'), day(2, 's_inar', 's_kink')), t, []);
     if (d.kind !== 'apply') throw new Error(d.kind);
     expect(d.confirm).toBeNull();
-    expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar', 's_kink'], ['s_kink']]);
+    expect(d.replaces).toBe('a1');
+    expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar', 's_kink'], []]);
+    expect(dayIds(d.before)).toEqual([['s_kiyo'], ['s_inar'], ['s_kink']]);
   });
 
-  it('keeps replies from two separate requests made from the same version', () => {
+  it('pasting only the final reply of a conversation still brings every change', () => {
+    const t = sent(trip(), 'tag001');
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo'), day(3, 's_kink')), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.confirm).toBeNull();
+    expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar'], ['s_kink']]);
+  });
+
+  it('asks before switching back to an older version', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 2, day(1, 's_kink')), t, []));
+    const d = planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.confirm).toBe('older-version');
+    expect(d.replacesRev).toBe(2);
+  });
+
+  it('keeps research saved since the earlier reply when replacing it', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []));
+    t = { ...t, spots: t.spots.map((s) => (s.id === 's_kink' ? { ...s, search: { summary: '筆記', sources: [], provider: 'p', at: 1 } } : s)) };
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo', 's_kink')), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.replaces).toBeDefined();
+    expect(d.result.trip.spots.find((s) => s.id === 's_kink')?.search?.summary).toBe('筆記');
+  });
+
+  it('applies on top (after asking) when the trip changed after an earlier reply', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []));
+    t = { ...t, days: t.days.map((d, i) => (i === 2 ? { ...d, items: [{ id: 'm1', spotId: 's_kink' }] } : d)) };
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo', 's_inar')), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.confirm).toBe('edited-after-reply');
+    expect(d.replaces).toBeUndefined();
+    expect(dayIds(d.result.trip)).toEqual([['s_kiyo', 's_inar'], ['s_inar'], ['s_kink']]);
+  });
+
+  it('two requests from the same version: the second asks, and the first one survives', () => {
     let t = sent(sent(trip(), 'aaaaaa'), 'bbbbbb');
     t = commit(t, planRelayApply(plan('aaaaaa', day(1, 's_kiyo')), t, []));
     const d = planRelayApply(plan('bbbbbb', day(3, 's_kink')), t, []);
     if (d.kind !== 'apply') throw new Error(d.kind);
-    // The trip moved on through request A's reply, so B asks before applying — and A's change survives.
     expect(d.confirm).toBe('edited-since-send');
     expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar'], ['s_kink']]);
   });
@@ -219,26 +318,40 @@ describe('planRelayApply', () => {
     expect(d.kind === 'apply' && d.confirm).toBe('edited-since-send');
   });
 
-  it('does not ask again after undoing a later reply to the same request', () => {
-    let t = sent(trip(), 'tag001');
-    t = commit(t, planRelayApply(plan('tag001', day(1, 's_kiyo')), t, []));
-    const afterFirst = structuredClone(t);
-    t = commit(t, planRelayApply(plan('tag001', day(3, 's_kink')), t, []));
-    // Undo the second reply.
-    const second = t.chat[t.chat.length - 1];
-    t = { ...t, ...second.undo!, chat: t.chat.map((m) => (m === second ? { ...m, undo: undefined, undone: true } : m)) };
-    expect(dayIds(t)).toEqual(dayIds(afterFirst));
-    const d = planRelayApply(plan('tag001', day(2, 's_kink')), t, []);
-    expect(d.kind === 'apply' && d.confirm).toBeNull();
-  });
-
-  it('recognises the same reply pasted twice, but allows it again after undo', () => {
+  it('is a duplicate only while that block is what the trip shows', () => {
     let t = sent(trip(), 'tag001');
     const reply = plan('tag001', day(1, 's_kiyo'));
     t = commit(t, planRelayApply(reply, t, []));
     expect(planRelayApply(reply, t, []).kind).toBe('duplicate');
-    t = { ...t, chat: t.chat.map((m) => (m.relayOps ? { ...m, undone: true, undo: undefined } : m)) };
-    expect(planRelayApply(reply, t, []).kind).toBe('apply');
+    // Edited by hand afterwards: the same block may be applied again (after asking).
+    const edited = { ...t, days: t.days.map((d, i) => (i === 0 ? { ...d, items: [] } : d)) };
+    const again = planRelayApply(reply, edited, []);
+    expect(again.kind === 'apply' && again.confirm).toBe('edited-after-reply');
+    // Undone: it applies cleanly again.
+    const undone = undoAt(t, 'a1');
+    const after = planRelayApply(reply, undone, []);
+    expect(after.kind === 'apply' && after.confirm).toBeNull();
+  });
+
+  it('the same operations for a different request are not a duplicate', () => {
+    let t = sent(trip(), 'req001');
+    t = commit(t, planRelayApply(plan('req001', day(1, 's_kiyo')), t, []));
+    t = sent({ ...t, days: t.days.map((d, i) => (i === 0 ? { ...d, items: [] } : d)) }, 'req002');
+    const d = planRelayApply(plan('req002', day(1, 's_kiyo')), t, []);
+    expect(d.kind === 'apply' && d.confirm).toBeNull();
+  });
+
+  it('after undoing an earlier reply, later replies are retired too and can be pasted again', () => {
+    let t = sent(trip(), 'tag001');
+    const r1 = planRev('tag001', 1, day(1, 's_kiyo'));
+    const r2 = planRev('tag001', 2, day(1, 's_kiyo'), day(3, 's_kink'));
+    t = commit(t, planRelayApply(r1, t, []));
+    t = commit(t, planRelayApply(r2, t, []));
+    t = undoAt(t, 'a1');
+    expect(dayIds(t)).toEqual([[], ['s_inar'], []]);
+    const d = planRelayApply(r2, t, []);
+    expect(d.kind === 'apply' && d.confirm).toBeNull();
+    if (d.kind === 'apply') expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar'], ['s_kink']]);
   });
 
   it("refuses a reply that belongs to another trip's request", () => {
@@ -248,7 +361,6 @@ describe('planRelayApply', () => {
   });
 
   it('asks before applying a reply whose request is unknown here', () => {
-    expect(planRelayApply(plan('zzzzzz', day(1, 's_kiyo')), trip(), []).kind === 'apply').toBe(true);
     const d1 = planRelayApply(plan('zzzzzz', day(1, 's_kiyo')), trip(), []);
     const d2 = planRelayApply(plan(undefined, day(1, 's_kiyo')), trip(), []);
     expect(d1.kind === 'apply' && d1.confirm).toBe('unknown-send');
@@ -280,6 +392,33 @@ describe('planRelayApply', () => {
     expect(d.issues.join()).toContain('第3天未更新');
     expect(dayIds(d.result.trip)).toEqual([[], ['s_kiyo'], []]);
     expect(dayIds(d.before)).toEqual([[], ['s_inar'], []]);
+  });
+
+  it('a corrected block after a partial apply replaces it cleanly', () => {
+    let t = sent(trip(), 'tag001');
+    const broken = block({
+      base: 'tag001',
+      rev: 1,
+      ops: [
+        { tool: 'update_spots', input: { updates: [{ spot_id: 's_kink', delete: true }] } },
+        { tool: 'set_day_plans', input: { days: [{ day: 3, items: [{ new_spot: { name: '無類別' } }] }] } },
+      ],
+    });
+    t = commit(t, planRelayApply(broken, t, []));
+    expect(t.spots.some((s) => s.id === 's_kink')).toBe(false);
+    const fixed = block({
+      base: 'tag001',
+      rev: 2,
+      ops: [
+        { tool: 'update_spots', input: { updates: [{ spot_id: 's_kink', delete: true }] } },
+        { tool: 'set_day_plans', input: { days: [{ day: 3, items: [{ new_spot: { name: '有類別', category: 'meal' } }] }] } },
+      ],
+    });
+    const d = planRelayApply(fixed, t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.issues).toEqual([]);
+    expect(d.replaces).toBeDefined();
+    expect(d.result.trip.spots.map((s) => s.name)).toEqual(['清水寺', '伏見稻荷大社', '有類別']);
   });
 
   it('treats a broken block as a message with problems, and plain text as a message', () => {

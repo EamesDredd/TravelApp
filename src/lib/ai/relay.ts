@@ -24,6 +24,8 @@ export interface ParsedReply {
   message: string;
   /** The send tag the AI echoed back, if any. */
   base?: string;
+  /** Version of the block within one AI conversation (1, 2, 3...), if given. */
+  rev?: number;
   /** Operations found in the reply; null when the reply has no usable block. */
   ops: RelayOp[] | null;
   /** Problems with the block itself (bad JSON, unknown tool...). */
@@ -74,6 +76,7 @@ const RULES = `- 「目前行程狀態」裡的資料以這則訊息為準。
 - add_candidates 只用在「加入候選但先不排進行程」的地點。
 - set_day_plans 會用你給的清單完整取代那一天，所以要列出那天所有項目，包含原本要保留的。
 - 一天不要排得太滿，保留彈性時間。
+- 修改區塊直接寫在回覆內文的最後，不要放進 Artifact、Canvas 或附件檔案。
 - 回答使用繁體中文（台灣用語），精簡、以條列為主。`;
 
 // In relay mode the AI never sees the ids the app assigns, so new places are referenced by name.
@@ -92,6 +95,7 @@ function toolDocs(): string {
 export function buildRelayPrompt(trip: TripSnapshot, request: string, tag: string, today = new Date()): string {
   const example = JSON.stringify({
     base: tag,
+    rev: 1,
     ops: [
       {
         tool: 'set_day_plans',
@@ -114,9 +118,9 @@ ${RULES}
 \`\`\`${RELAY_FENCE}
 ${example}
 \`\`\`
-3. "base" 固定寫 "${tag}"（代表我這次的請求）；"ops" 依序列出要執行的指令。範例裡的 s_xxxx 只是示意，請換成真正的 spot_id。
+3. "base" 固定寫 "${tag}"（代表我這次的請求）；"rev" 是這個區塊的版本，第一個區塊寫 1；"ops" 依序列出要執行的指令。範例裡的 s_xxxx 只是示意，請換成真正的 spot_id。
 4. JSON 要完整有效：雙引號、不要註解、不要用「…」省略任何內容。
-5. 之後在這個對話裡我如果繼續要求修改，新的區塊只要列出「這次要做的修改」就好；App 會把它套用在已經更新過的行程上。base 一樣寫 "${tag}"。
+5. 之後在這個對話裡我如果繼續要求修改，每次的區塊都要列出這個請求「全部」的修改（包含先前區塊裡仍要保留的修改），並把 rev 加 1。App 會用最新的區塊取代先前套用的版本，所以我只貼最後一則回覆也不會漏掉。
 
 ## 可用的指令
 ${toolDocs()}
@@ -135,7 +139,7 @@ export function buildFixPrompt(tag: string | undefined, issues: string[]): strin
 你剛才的修改區塊有以下問題，App 沒有套用這些部分：
 ${issues.map((i) => `- ${i}`).join('\n')}
 
-請修正後重新輸出完整的 \`\`\`${RELAY_FENCE} 區塊${tag ? `（base 一樣寫 "${tag}"）` : ''}。new_spot 一定要有 name 和 category（sight / breakfast / meal），spot_id 只能用行程資料裡出現過的 id。`;
+請修正後重新輸出一個完整的 \`\`\`${RELAY_FENCE} 區塊：列出這個請求「全部」的修改（包含沒有問題的部分），rev 加 1${tag ? `，base 一樣寫 "${tag}"` : ''}。App 會用它取代先前套用的版本。new_spot 一定要有 name 和 category（sight / breakfast / meal），spot_id 只能用行程資料裡出現過的 id。`;
 }
 
 /** True when pasted text is one of our own outgoing messages rather than the AI's reply. */
@@ -214,53 +218,48 @@ function fences(text: string): Fence[] {
 
 const TRUNCATED = '修改區塊不完整（可能被截斷），請 AI 重新輸出完整區塊。';
 
-/** Finds the operations block in a pasted AI reply (whole reply, or just the block). */
+/** Where a block object can start: {"base": …, {"ops": … or {"rev": … (straight or smart quotes). */
+const BLOCK_START = /\{\s*["“](?:base|ops|rev)["”]\s*:/g;
+
+/**
+ * Finds the operations block in a pasted AI reply (the whole reply, just the block, fenced
+ * or copied as plain text). The LAST block in the reply is the AI's latest word: if it is
+ * cut off, nothing is applied rather than falling back to an earlier, superseded block.
+ */
 export function parseRelayReply(raw: string): ParsedReply {
   const text = raw.replace(/\r\n?/g, '\n').trim();
   const problems: string[] = [];
-  let found: { obj: Record<string, unknown>; remove: string; end: number } | null = null;
+  let found: { obj: Record<string, unknown>; at: number; json: string } | null = null;
 
-  // 1) Fenced blocks: the last ```travelplan wins; otherwise the last block holding {"ops": [...]}.
-  const blocks = fences(text);
-  const lastPlan = blocks.filter((b) => b.lang === RELAY_FENCE).pop();
-  const candidates = lastPlan ? [lastPlan] : blocks.slice().reverse();
-  for (const b of candidates) {
-    const at = b.body.indexOf('{');
-    const json = at >= 0 ? balancedObject(b.body, at) : null;
+  const starts = [...text.matchAll(BLOCK_START)].map((m) => m.index);
+  if (starts.length) {
+    const at = starts[starts.length - 1];
+    const json = balancedObject(text, at);
     const v = json ? tryJson(json) : undefined;
-    if (isObj(v) && Array.isArray(v.ops)) {
-      found = { obj: v, remove: b.full, end: b.end };
-      break;
-    }
-  }
-  if (lastPlan && !found) problems.push(TRUNCATED);
-
-  // 2) No fence at all (copied as plain text): scan for {"base"…} / {"ops"…}.
-  if (!found && !lastPlan) {
-    const re = /\{\s*"(?:base|ops)"\s*:/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text))) {
-      const json = balancedObject(text, m.index);
-      const v = json ? tryJson(json) : undefined;
-      if (json && isObj(v) && Array.isArray(v.ops)) found = { obj: v, remove: json, end: m.index + json.length };
-    }
+    if (json && isObj(v) && Array.isArray(v.ops)) found = { obj: v, at, json };
+    else problems.push(json && isObj(v) ? '修改區塊格式不正確（缺少 ops 清單），請 AI 重新輸出。' : TRUNCATED);
   }
 
-  // A travelplan block opened after the one we found but never closed means the AI's
-  // latest version was cut off: never fall back to the earlier, superseded block.
-  const opener = new RegExp(`(^|\\n)[ \\t]*(\`{3,}|~{3,})[ \\t]*${RELAY_FENCE}`, 'g');
-  let lastOpen = -1;
-  for (let m = opener.exec(text); m; m = opener.exec(text)) lastOpen = m.index;
-  if (lastOpen >= 0 && (!found || lastOpen >= found.end)) {
-    if (!problems.includes(TRUNCATED)) problems.push(TRUNCATED);
+  // A travelplan fence or tag line after the block we found (or with none found) means the
+  // AI's latest block never arrived intact.
+  const markers = [
+    ...text.matchAll(new RegExp(`(^|\\n)[ \\t]*(\`{3,}|~{3,})[ \\t]*${RELAY_FENCE}`, 'gi')),
+    ...text.matchAll(new RegExp(`(^|\\n)[ \\t]*${RELAY_FENCE}[ \\t]*(?=\\n|$)`, 'gi')),
+  ].map((m) => m.index);
+  const lastMarker = markers.length ? Math.max(...markers) : -1;
+  if (lastMarker >= 0 && (!found || lastMarker > found.at)) {
     found = null;
+    if (!problems.length) problems.push(TRUNCATED);
   }
 
   let message = text;
-  if (found) message = message.replace(found.remove, '\n');
+  if (found) {
+    const fence = fences(text).find((b) => b.start <= found!.at && found!.at < b.end);
+    message = message.replace(fence ? fence.full : found.json, '\n');
+  }
   // Drop a dangling language tag left by "copy text" on some apps (e.g. "travelplan\n複製程式碼").
   message = message
-    .replace(new RegExp(`(^|\\n)\\s*${RELAY_FENCE}\\s*(\\n|$)`, 'g'), '\n\n')
+    .replace(new RegExp(`(^|\\n)\\s*${RELAY_FENCE}\\s*(\\n|$)`, 'gi'), '\n\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
@@ -279,7 +278,9 @@ export function parseRelayReply(raw: string): ParsedReply {
     ops.push({ tool: op.tool, input: op.input });
   });
   const base = typeof found.obj.base === 'string' && found.obj.base.trim() ? found.obj.base.trim() : undefined;
-  return { message, base, ops, problems };
+  const revNum = Number(found.obj.rev);
+  const rev = Number.isInteger(revNum) && revNum > 0 ? revNum : undefined;
+  return { message, base, rev, ops, problems };
 }
 
 // ------------------------------------------------------------------ applying
@@ -298,12 +299,24 @@ export function applyRelayOps(start: TripSnapshot, ops: RelayOp[]): RelayApplyRe
     const r = applyToolCall(trip, op.tool, op.input);
     trip = r.trip;
     summary.push(...r.summary);
-    const lines = r.result.split('\n');
-    if (r.isError) errors.push(...lines.map((l) => l.replace(/^錯誤：/, '')));
-    else errors.push(...lines.filter((l) => l.startsWith('錯誤：')).map((l) => l.slice(3)));
+    const failed = r.result
+      .split('\n')
+      .filter((l) => l.startsWith('錯誤：'))
+      .map((l) => l.slice(3));
+    errors.push(...(failed.length || !r.isError ? failed : [r.result]));
   }
   return { trip, summary, errors };
 }
+
+export type RelayConfirm =
+  /** No record of the request in this trip (other device, cleared chat, or no tag). */
+  | 'unknown-send'
+  /** The trip changed after sending and no reply to this request is applied yet. */
+  | 'edited-since-send'
+  /** A reply to this request was applied, but the trip changed again afterwards. */
+  | 'edited-after-reply'
+  /** This block is an older version than the one already applied. */
+  | 'older-version';
 
 export type RelayDecision =
   /** The clipboard held our own outgoing message. */
@@ -311,36 +324,45 @@ export type RelayDecision =
   | { kind: 'empty' }
   /** The reply answers a request sent from another trip. */
   | { kind: 'other-trip'; tripName: string }
-  /** This exact block was already applied (and not undone). */
+  /** This exact block is already what the trip shows. */
   | { kind: 'duplicate' }
   /** No operations to apply: a discussion reply, or a broken block. */
   | { kind: 'message-only'; parsed: ParsedReply }
   | {
       kind: 'apply';
       parsed: ParsedReply;
-      /** The trip before applying, for undo. */
+      /** The trip right now, for undo. */
       before: TripSnapshot;
-      /** Ask before applying: the request is unknown here, or the trip changed since it was sent. */
-      confirm: null | 'unknown-send' | 'edited-since-send';
+      confirm: RelayConfirm | null;
+      /** Id of the earlier reply to the same request that this one replaces, if any. */
+      replaces?: string;
+      /** Version number of the block it replaces, for the confirm text. */
+      replacesRev?: number;
       result: RelayApplyResult;
       opsFp: string;
       /** Problems with the block plus operations that failed; the rest applied cleanly. */
       issues: string[];
     };
 
+/** Keeps place research saved since `base` was taken (it is not part of the plan). */
+function withCurrentResearch(base: TripSnapshot, current: TripSnapshot): TripSnapshot {
+  const research = new Map(current.spots.filter((s) => s.search).map((s) => [s.id, s.search]));
+  return { ...base, spots: base.spots.map((s) => (research.has(s.id) ? { ...s, search: research.get(s.id) } : s)) };
+}
+
 /**
- * Decides what pasting `raw` into `trip` should do. Operations always apply to the
- * CURRENT trip (never an old snapshot), so follow-up replies build on earlier ones
- * and nothing saved in between is lost.
+ * Decides what pasting `raw` into `trip` should do.
+ *
+ * Each block holds ALL changes for its request, so a newer reply to the same request
+ * replaces the one applied before it: when nothing else changed since, the earlier
+ * reply is rolled back first and the new block applied in its place. Otherwise blocks
+ * apply to the current trip, and anything surprising is flagged for confirmation.
  */
 export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, 'name' | 'chat'>[]): RelayDecision {
   if (looksLikeOwnPrompt(raw)) return { kind: 'own-prompt' };
   const parsed = parseRelayReply(raw);
   if (!parsed.message && !parsed.ops && !parsed.problems.length) return { kind: 'empty' };
   if (!parsed.ops?.length) return { kind: 'message-only', parsed };
-
-  const opsFp = opsFingerprint(parsed.ops);
-  if (trip.chat.some((m) => m.relayOps === opsFp && !m.undone)) return { kind: 'duplicate' };
 
   const sent: ChatMessage | undefined = parsed.base ? trip.chat.find((m) => m.relay?.tag === parsed.base) : undefined;
   if (parsed.base && !sent) {
@@ -350,18 +372,41 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
 
   const current = snapshotOf(trip);
   const currentFp = tripFingerprint(current);
-  let confirm: null | 'unknown-send' | 'edited-since-send' = null;
+  const opsFp = opsFingerprint(parsed.ops);
+  // Replies to this request whose changes still stand, oldest first.
+  const applied = sent
+    ? trip.chat.filter((m) => m.role === 'assistant' && m.relayBase === parsed.base && m.relayResult && !m.undone)
+    : [];
+  const latest = applied[applied.length - 1];
+  if (latest && latest.relayOps === opsFp && latest.relayResult === currentFp) return { kind: 'duplicate' };
+
+  let start = current;
+  let confirm: RelayConfirm | null = null;
+  let replaces: string | undefined;
   if (!sent) {
     confirm = 'unknown-send';
-  } else {
-    // Versions the trip may legitimately be at: as sent, or after any reply to this request that still stands.
-    const known = new Set([
-      sent.relay!.fp,
-      ...trip.chat.filter((m) => m.relayBase === parsed.base && m.relayResult && !m.undone).map((m) => m.relayResult!),
-    ]);
-    if (!known.has(currentFp)) confirm = 'edited-since-send';
+  } else if (latest) {
+    if (latest.relayResult === currentFp && latest.undo) {
+      start = withCurrentResearch(latest.undo, current);
+      replaces = latest.id;
+    } else {
+      confirm = 'edited-after-reply';
+    }
+    if (parsed.rev && latest.relayRev && parsed.rev < latest.relayRev) confirm = 'older-version';
+  } else if (sent.relay!.fp !== currentFp) {
+    confirm = 'edited-since-send';
   }
 
-  const result = applyRelayOps(current, parsed.ops);
-  return { kind: 'apply', parsed, before: current, confirm, result, opsFp, issues: [...parsed.problems, ...result.errors] };
+  const result = applyRelayOps(start, parsed.ops);
+  return {
+    kind: 'apply',
+    parsed,
+    before: current,
+    confirm,
+    replaces,
+    replacesRev: latest?.relayRev,
+    result,
+    opsFp,
+    issues: [...parsed.problems, ...result.errors],
+  };
 }

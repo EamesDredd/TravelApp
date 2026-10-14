@@ -156,8 +156,11 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
     setPending({ ...p, recorded: true });
   };
 
-  /** Called straight from the tap so the share sheet is allowed to open. */
-  const sendRelay = async (text: string) => {
+  /**
+   * Builds the message for the user's AI app from the trip as it is now, then shares it
+   * (or copies it). Called straight from the tap so the share sheet / clipboard is allowed.
+   */
+  const sendRelay = async (text: string, via: 'share' | 'copy' = 'share') => {
     const t = getCurrentTrip();
     if (!t) return;
     const snapshot = snapshotOf(t);
@@ -171,14 +174,17 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
       recorded: false,
     };
     setPending(p);
-    const result = await sendToAiApp(p.prompt);
+    const result = via === 'copy' ? ((await copyText(p.prompt)) ? 'copied' : 'failed') : await sendToAiApp(p.prompt);
     if (result === 'shared' || result === 'copied') recordSend(p);
     if (result === 'copied') toast('已複製，請貼到 Claude 或 ChatGPT 送出');
-    if (result === 'failed') toast('無法自動傳送，請按下方「複製內容」');
+    if (result === 'failed') toast('無法自動傳送，請按下方「⧉ 複製」');
   };
 
-  const copyPending = async () => {
-    if (!pending) return;
+  /** "Copy" sends what is typed now; with an empty box it copies a message whose share did not go through. */
+  const copySend = async () => {
+    const text = input.trim();
+    if (text) return sendRelay(text, 'copy');
+    if (!pending || pending.recorded) return;
     if (await copyText(pending.prompt)) {
       recordSend(pending);
       toast('已複製，請貼到 Claude 或 ChatGPT 送出');
@@ -219,47 +225,64 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           toast('修改區塊不完整，沒有套用');
           return;
         }
-        if (!confirm(`這段內容沒有行程修改區塊，要加入對話紀錄嗎？\n\n${preview(parsed.message)}`)) return;
+        const ok = confirm(
+          `這段內容沒有行程修改區塊。\n（如果 AI 說它改了行程，請在 AI App 複製「整則」回覆，包含最後的程式碼區塊。）\n\n要把它加入對話紀錄嗎？\n\n${preview(parsed.message)}`,
+        );
+        if (!ok) return;
         addReply({ text: parsed.message });
         toast('已加入對話紀錄');
         return;
       }
       case 'apply': {
-        if (
-          d.confirm === 'unknown-send' &&
-          !confirm(`找不到這則回覆對應的傳送紀錄（可能來自其他裝置，或對話已清除）。\n要套用到目前的旅程「${t.name}」嗎？`)
-        ) {
-          return;
-        }
-        if (
-          d.confirm === 'edited-since-send' &&
-          !confirm('傳給 AI 之後，行程有其他變動。AI 的修改可能會覆蓋那幾天的安排，要繼續嗎？（之後可按「復原」）')
-        ) {
-          return;
-        }
+        const questions = {
+          'unknown-send': `找不到這則回覆對應的傳送紀錄（可能來自其他裝置，或對話已清除）。\n要套用到目前的旅程「${t.name}」嗎？`,
+          'edited-since-send': '傳給 AI 之後，行程有其他變動。AI 的修改可能會覆蓋那幾天的安排，要繼續嗎？（之後可按「復原」）',
+          'edited-after-reply':
+            '這個請求先前的回覆已經套用，之後行程又有變動。要把這則回覆直接套用在目前的行程上嗎？（之後可按「復原」）',
+          'older-version': `這是較早的版本（第 ${d.parsed.rev} 版），目前套用的是第 ${d.replacesRev} 版。要改用這個版本嗎？`,
+        } as const;
+        if (d.confirm && !confirm(questions[d.confirm])) return;
+
         let result = d.result.trip;
-        let applied = true;
         if (d.issues.length) {
           const list = d.issues.slice(0, 5).map((i) => `・${i}`).join('\n');
-          applied =
+          const partial =
             d.result.summary.length > 0 &&
             confirm(`AI 的修改有 ${d.issues.length} 個問題：\n${list}\n\n要先套用沒問題的部分嗎？（也可以把問題傳回給 AI 修正）`);
-          if (!applied) result = d.before;
+          if (!partial) result = d.before;
         }
         const resultFp = tripFingerprint(result);
         const changed = resultFp !== tripFingerprint(d.before);
-        if (changed) replaceSnapshot(result);
-        const actions = changed ? [...d.result.summary] : ['⚠️ 沒有套用任何修改'];
-        if (changed && !actions.length) actions.push('已更新行程');
+        if (changed) {
+          replaceSnapshot(result);
+          if (d.replaces) updateChat(d.replaces, { superseded: true });
+        }
+        const actions: string[] = changed
+          ? d.result.summary.length
+            ? [...d.result.summary]
+            : ['已更新行程']
+          : d.issues.length
+            ? ['⚠️ 沒有套用任何修改']
+            : ['AI 的修改和目前行程相同，沒有變更'];
+        if (changed && d.replaces) actions.push('取代了這個請求先前套用的回覆');
         actions.push(...d.issues.map((i) => `⚠️ ${i}`));
         addReply({
           text: d.parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
           actions,
           ...(d.parsed.base ? { relayBase: d.parsed.base } : {}),
+          ...(d.parsed.rev ? { relayRev: d.parsed.rev } : {}),
           ...(changed ? { undo: d.before, relayResult: resultFp, relayOps: d.opsFp } : {}),
           ...(d.issues.length ? { relayFix: buildFixPrompt(d.parsed.base, d.issues) } : {}),
         });
-        toast(changed ? (d.issues.length ? '已套用部分修改' : '已套用 AI 的修改') : '沒有套用，可以把問題傳回給 AI 修正');
+        toast(
+          changed
+            ? d.issues.length
+              ? '已套用部分修改'
+              : '已套用 AI 的修改'
+            : d.issues.length
+              ? '沒有套用，可以把問題傳回給 AI 修正'
+              : '和目前行程相同，沒有變更',
+        );
         return;
       }
     }
@@ -280,11 +303,28 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
     else void sendRelay(text);
   };
 
+  /** Restoring an older snapshot also reverts every later change, so later undo points are retired too. */
   const undo = (m: ChatMessage) => {
-    if (!m.undo) return;
-    if (!confirm('復原這次 AI 的修改？之後手動做的變更也會一起還原。')) return;
-    replaceSnapshot(m.undo);
-    updateChat(m.id, { undo: undefined, undone: true });
+    const t = getCurrentTrip();
+    if (!m.undo || !t) return;
+    const idx = t.chat.findIndex((x) => x.id === m.id);
+    const later = t.chat.slice(idx + 1).filter((x) => x.undo);
+    const question = later.length
+      ? `復原到這則回覆之前的狀態？之後的 ${later.length} 次 AI 修改和手動變更也會一起還原。`
+      : '復原這次 AI 的修改？之後手動做的變更也會一起還原。';
+    if (!confirm(question)) return;
+    const restored = m.undo;
+    replaceSnapshot(restored);
+    for (const x of [m, ...later]) updateChat(x.id, { undo: undefined, undone: true });
+    // A reply this one had replaced is in effect again.
+    if (m.relayBase) {
+      const fp = tripFingerprint(restored);
+      const back = t.chat
+        .slice(0, idx)
+        .reverse()
+        .find((x) => x.relayBase === m.relayBase && x.superseded && !x.undone && x.relayResult === fp);
+      if (back) updateChat(back.id, { superseded: false });
+    }
     toast('已復原');
   };
 
@@ -370,9 +410,9 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           <button className="btn btn-sm btn-primary" onClick={pasteReply}>
             📋 貼上回覆
           </button>
-          {pending && (
-            <button className="btn btn-sm" onClick={copyPending}>
-              ⧉ 複製內容
+          {(input.trim() || (pending && !pending.recorded)) && (
+            <button className="btn btn-sm" onClick={copySend} title="不用分享選單，改用複製再貼到 AI App">
+              ⧉ 複製
             </button>
           )}
           <span className="grow" />
@@ -462,7 +502,7 @@ function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
     return (
       <div className="bubble user">
         {m.text}
-        {m.relay && <div className="relay-tag">已傳給 AI App</div>}
+        {m.relay && <div className="relay-tag">已傳給 AI App · 回覆後複製整則，按「📋 貼上回覆」</div>}
       </div>
     );
   }
@@ -471,6 +511,7 @@ function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
     <div className="bubble assistant">
       <Markdown text={m.text} />
       {m.sources && m.sources.length > 0 && <Sources sources={m.sources} />}
+      {m.superseded && !m.undone && <div className="muted small">（已由這個請求較新的回覆取代）</div>}
       {(!!m.actions?.length || !!m.undo || !!m.undone || !!m.relayFix) && (
         <div className="actions-box">
           {m.actions && m.actions.length > 0 && (
