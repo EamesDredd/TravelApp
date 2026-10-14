@@ -227,8 +227,16 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         }
         if (parsed.ops) {
           // An empty block: the AI says there is nothing to change.
-          addReply({ text: parsed.message || '（AI 的回覆）', actions: ['ℹ️ AI 表示這次不需要修改行程'] });
-          toast('這則回覆沒有要修改行程');
+          addReply({
+            text: parsed.message || '（AI 的回覆）',
+            actions: d.cannotRevert
+              ? [
+                  'ℹ️ AI 這次沒有附任何修改',
+                  'ℹ️ 這個請求先前套用的修改還在（之後行程有其他變動，無法自動還原）；要取消的話，請按先前那則回覆的「↶ 復原這次修改」',
+                ]
+              : ['ℹ️ AI 表示這次不需要修改行程'],
+          });
+          toast(d.cannotRevert ? '先前的修改還在，可用該則回覆的「復原」取消' : '這則回覆沒有要修改行程');
           return;
         }
         const ok = confirm(
@@ -247,11 +255,18 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
             '這個請求先前的回覆已經套用，之後行程又有變動。要把這則回覆直接套用在目前的行程上嗎？（之後可按「復原」）',
           'older-version': `這是較早的版本（第 ${d.parsed.rev} 版），目前套用的是第 ${d.replacesRev} 版。要改用這個版本嗎？`,
         } as const;
-        if (d.confirm && !confirm(questions[d.confirm])) return;
         const notes = d.parsed.notes.map((n) => `ℹ️ ${n}`);
+        if (d.revertsRequest) {
+          // An empty block in a follow-up: the AI takes back everything this request changed.
+          const older = d.confirm === 'older-version' ? `這是較早的版本（第 ${d.parsed.rev} 版）。\n` : '';
+          if (!confirm(`${older}AI 這次沒有附任何修改，套用會把這個請求先前的修改全部還原，要還原嗎？（之後可按「復原」）`)) {
+            addReply({ text: d.parsed.message || '（AI 的回覆）', actions: ['ℹ️ 保留了這個請求先前套用的修改', ...notes] });
+            return;
+          }
+        } else if (d.confirm && !confirm(questions[d.confirm])) return;
 
         // A broken version never replaces one that applied cleanly; ask the AI to fix it instead.
-        if (d.replaces && d.issues.length) {
+        if (d.replaces && d.issues.length && !d.replacesBroken) {
           addReply({
             text: d.parsed.message || '（AI 的回覆）',
             actions: ['⚠️ 這一版有問題，先保留目前套用的版本', ...d.issues.map((i) => `⚠️ ${i}`), ...notes],
@@ -263,6 +278,7 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         }
 
         let apply = d.result;
+        let issues = d.issues;
         let replaced = !!d.replaces;
         if (d.dropped.length && d.onCurrent) {
           const swap = confirm(
@@ -271,15 +287,17 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           if (!swap) {
             if (!confirm('要把這一版套用在目前的行程上，保留先前的修改嗎？')) return;
             apply = d.onCurrent;
+            issues = d.onCurrentIssues ?? d.issues;
           }
         }
+        const onTop = apply !== d.result;
 
         let result = apply.trip;
-        if (d.issues.length) {
-          const list = d.issues.slice(0, 5).map((i) => `・${i}`).join('\n');
+        if (issues.length) {
+          const list = issues.slice(0, 5).map((i) => `・${i}`).join('\n');
           const partial =
             apply.summary.length > 0 &&
-            confirm(`AI 的修改有 ${d.issues.length} 個問題：\n${list}\n\n要先套用沒問題的部分嗎？（也可以把問題傳回給 AI 修正）`);
+            confirm(`AI 的修改有 ${issues.length} 個問題：\n${list}\n\n要先套用沒問題的部分嗎？（也可以把問題傳回給 AI 修正）`);
           if (!partial) result = d.before;
         }
         const resultFp = tripFingerprint(result);
@@ -287,32 +305,39 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         if (!changed) replaced = false;
         if (changed) {
           replaceSnapshot(result);
-          if (d.replaces) updateChat(d.replaces, { superseded: true });
+          // The new reply carries the request's starting point from here on.
+          if (d.replaces) updateChat(d.replaces, { superseded: true, relayStart: undefined });
         }
-        const actions: string[] = changed
-          ? apply.summary.length
-            ? [...apply.summary]
-            : ['已更新行程']
-          : d.issues.length
+        const actions: string[] = !changed
+          ? issues.length
             ? ['⚠️ 沒有套用任何修改']
-            : ['AI 的修改和目前行程相同，沒有變更'];
-        if (replaced) actions.push(apply === d.result ? '取代了這個請求先前套用的版本' : '套用在目前的行程上（保留先前的修改）');
-        if (replaced && apply === d.result && d.dropped.length) actions.push(...d.dropped);
-        actions.push(...d.issues.map((i) => `⚠️ ${i}`), ...notes);
+            : ['AI 的修改和目前行程相同，沒有變更']
+          : d.revertsRequest
+            ? ['已還原這個請求先前套用的修改']
+            : apply.summary.length
+              ? [...apply.summary]
+              : ['已更新行程'];
+        if (replaced && !d.revertsRequest) {
+          actions.push(onTop ? '套用在目前的行程上（保留先前的修改）' : '取代了這個請求先前套用的版本');
+        }
+        if (replaced && !onTop && d.dropped.length) actions.push(...d.dropped);
+        actions.push(...issues.map((i) => `⚠️ ${i}`), ...notes);
         addReply({
           text: d.parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
           actions,
           ...(d.parsed.base ? { relayBase: d.parsed.base } : {}),
           ...(d.parsed.rev ? { relayRev: d.parsed.rev } : {}),
           ...(changed ? { undo: d.before, relayResult: resultFp, relayOps: d.opsFp, relayStart: d.requestBase } : {}),
-          ...(d.issues.length ? { relayFix: buildFixPrompt(d.parsed.base, d.issues) } : {}),
+          ...(issues.length ? { relayFix: buildFixPrompt(d.parsed.base, issues) } : {}),
         });
         toast(
           changed
-            ? d.issues.length
-              ? '已套用部分修改'
-              : '已套用 AI 的修改'
-            : d.issues.length
+            ? d.revertsRequest
+              ? '已還原這個請求的修改'
+              : issues.length
+                ? '已套用部分修改'
+                : '已套用 AI 的修改'
+            : issues.length
               ? '沒有套用，可以把問題傳回給 AI 修正'
               : '和目前行程相同，沒有變更',
         );
@@ -347,16 +372,18 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
       : '復原這次 AI 的修改？之後手動做的變更也會一起還原。';
     if (!confirm(question)) return;
     const restored = m.undo;
+    // Replies that replace each other share one starting point; only the one in effect holds it.
+    const start = t.chat.slice(idx).find((x) => x.relayBase === m.relayBase && x.relayStart && !x.undone)?.relayStart;
     replaceSnapshot(restored);
-    for (const x of [m, ...later]) updateChat(x.id, { undo: undefined, undone: true });
-    // A reply this one had replaced is in effect again.
+    for (const x of [m, ...later]) updateChat(x.id, { undo: undefined, relayStart: undefined, undone: true });
+    // A reply this one had replaced is in effect again, and takes back the request's starting point.
     if (m.relayBase) {
       const fp = tripFingerprint(restored);
       const back = t.chat
         .slice(0, idx)
         .reverse()
         .find((x) => x.relayBase === m.relayBase && x.superseded && !x.undone && x.relayResult === fp);
-      if (back) updateChat(back.id, { superseded: false });
+      if (back) updateChat(back.id, { superseded: false, relayStart: back.relayStart ?? start });
     }
     toast('已復原');
   };

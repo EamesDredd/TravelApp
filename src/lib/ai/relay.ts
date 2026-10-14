@@ -334,9 +334,10 @@ export function parseRelayReply(raw: string): ParsedReply {
   // Several blocks: a higher rev supersedes; blocks of the same rev are parts of one answer.
   const revs = blocks.map((b) => b.rev).filter((r): r is number => r !== undefined);
   const top = revs.length ? Math.max(...revs) : undefined;
-  const chosen = top === undefined ? blocks : blocks.filter((b) => b.rev === top);
+  // Blocks without a rev are parts of the same answer; only an explicitly lower rev is superseded.
+  const chosen = top === undefined ? blocks : blocks.filter((b) => b.rev === undefined || b.rev === top);
   if (chosen.length > 1) notes.push(`回覆裡有 ${chosen.length} 個修改區塊，已依序合併套用`);
-  if (chosen.length < blocks.length) notes.push(`只套用最新版本（第 ${top} 版）的修改區塊`);
+  if (chosen.length < blocks.length) notes.push(`回覆裡較舊版本的修改區塊已略過，只套用第 ${top} 版`);
 
   const ops: RelayOp[] = [];
   chosen.forEach((b) =>
@@ -400,8 +401,12 @@ export type RelayDecision =
   | { kind: 'other-trip'; tripName: string }
   /** This exact block is already what the trip shows. */
   | { kind: 'duplicate' }
-  /** No operations to apply: a discussion reply, an empty block, or a broken block. */
-  | { kind: 'message-only'; parsed: ParsedReply }
+  /**
+   * No operations to apply: a discussion reply, a broken block, or an empty block. For an empty
+   * block, `cannotRevert` means an earlier reply to this request still has changes in the trip
+   * that this one cannot take back (the trip has moved on since).
+   */
+  | { kind: 'message-only'; parsed: ParsedReply; cannotRevert?: boolean }
   | {
       kind: 'apply';
       parsed: ParsedReply;
@@ -413,6 +418,10 @@ export type RelayDecision =
       /** Id of the earlier reply to the same request that this one replaces, if any. */
       replaces?: string;
       replacesRev?: number;
+      /** The reply being replaced had problems itself, so a version with problems may still improve on it. */
+      replacesBroken?: boolean;
+      /** An empty block: applying it undoes everything this request changed. */
+      revertsRequest?: boolean;
       result: RelayApplyResult;
       opsFp: string;
       /** Problems with the block plus operations that failed. */
@@ -423,6 +432,7 @@ export type RelayDecision =
        */
       dropped: string[];
       onCurrent?: RelayApplyResult;
+      onCurrentIssues?: string[];
     };
 
 const nameKey = (n: string) => n.replace(/\s+/g, '').toLowerCase();
@@ -454,22 +464,75 @@ function daysMentioned(ops: RelayOp[]): Set<number> {
   return out;
 }
 
-/** What the earlier reply changed (base → current) that the new result puts back as it was. */
+/** Spot fields the plan cares about (research is kept separately). */
+const spotSig = (s: TripSnapshot['spots'][number]) =>
+  JSON.stringify([s.name, s.category, s.address ?? '', s.lat ?? null, s.lng ?? null, s.note ?? '', s.durationMin ?? null]);
+
+/**
+ * What the earlier reply changed (base → current) that the new result quietly puts back,
+ * described for the confirm dialog. Days the new block mentions are its own decision.
+ */
 function droppedChanges(base: TripSnapshot, current: TripSnapshot, result: TripSnapshot, ops: RelayOp[]): string[] {
-  const mentioned = daysMentioned(ops);
   const out: string[] = [];
-  const n = Math.max(base.days.length, current.days.length, result.days.length);
-  const days: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const before = daySig(base, i);
-    if (daySig(current, i) !== before && daySig(result, i) === before && !mentioned.has(i + 1)) days.push(i + 1);
+  const reverted = (b: unknown, c: unknown, r: unknown) => c !== b && r === b;
+
+  if (reverted(base.name, current.name, result.name)) out.push(`旅程名稱會改回「${base.name}」`);
+  if (reverted(base.destination, current.destination, result.destination)) out.push(`目的地會改回「${base.destination || '未設定'}」`);
+  if (reverted(base.startDate, current.startDate, result.startDate)) out.push(`出發日期會改回 ${base.startDate ?? '未設定'}`);
+
+  const mentioned = daysMentioned(ops);
+  const back: number[] = [];
+  const removed: number[] = [];
+  for (let i = 0; i < Math.max(base.days.length, current.days.length); i++) {
+    if (mentioned.has(i + 1)) continue;
+    if (i < current.days.length && i >= result.days.length) removed.push(i + 1);
+    else if (daySig(current, i) !== daySig(base, i) && daySig(result, i) === daySig(base, i)) back.push(i + 1);
   }
-  if (days.length) out.push(`第 ${days.join('、')} 天會回到原本的安排`);
-  const keep = new Set(result.spots.map((s) => nameKey(s.name)));
-  const had = new Set(base.spots.map((s) => nameKey(s.name)));
-  const gone = current.spots.filter((s) => !had.has(nameKey(s.name)) && !keep.has(nameKey(s.name))).map((s) => s.name);
+  if (removed.length) out.push(`第 ${removed.join('、')} 天會被刪除`);
+  if (back.length) out.push(`第 ${back.join('、')} 天會回到原本的安排`);
+
+  const byName = (t: TripSnapshot) => new Map(t.spots.map((s) => [nameKey(s.name), s]));
+  const b = byName(base);
+  const r = byName(result);
+  const gone: string[] = [];
+  const undone: string[] = [];
+  for (const s of current.spots) {
+    const k = nameKey(s.name);
+    const was = b.get(k);
+    if (!was && !r.has(k)) gone.push(s.name);
+    else if (was && spotSig(s) !== spotSig(was) && r.get(k) && spotSig(r.get(k)!) === spotSig(was)) undone.push(s.name);
+  }
+  const cur = byName(current);
+  const restored = base.spots.filter((s) => !cur.has(nameKey(s.name)) && r.has(nameKey(s.name))).map((s) => s.name);
   if (gone.length) out.push(`先前新增的「${gone.join('、')}」會被移除`);
+  if (undone.length) out.push(`「${undone.join('、')}」先前改過的資料會還原`);
+  if (restored.length) out.push(`先前刪除的「${restored.join('、')}」會恢復`);
   return out;
+}
+
+/**
+ * Re-applying a block from the request's starting point creates its new places again with new
+ * ids; give them back the ids they already have in the trip, so other requests' references hold.
+ */
+function keepPlaceIds(result: TripSnapshot, requestBase: TripSnapshot, current: TripSnapshot): TripSnapshot {
+  const baseIds = new Set(requestBase.spots.map((s) => s.id));
+  const taken = new Set(result.spots.map((s) => s.id));
+  const existing = new Map(current.spots.map((s) => [nameKey(s.name), s.id]));
+  const remap = new Map<string, string>();
+  for (const s of result.spots) {
+    if (baseIds.has(s.id)) continue;
+    const old = existing.get(nameKey(s.name));
+    if (old && old !== s.id && !taken.has(old)) {
+      remap.set(s.id, old);
+      taken.add(old);
+    }
+  }
+  if (!remap.size) return result;
+  return {
+    ...result,
+    spots: result.spots.map((s) => (remap.has(s.id) ? { ...s, id: remap.get(s.id)! } : s)),
+    days: result.days.map((d) => ({ ...d, items: d.items.map((it) => (remap.has(it.spotId) ? { ...it, spotId: remap.get(it.spotId)! } : it)) })),
+  };
 }
 
 /**
@@ -503,8 +566,11 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
   if (latest && latest.relayOps === opsFp && latest.relayResult === currentFp) return { kind: 'duplicate' };
 
   const canReplace = !!latest && latest.relayResult === currentFp && !!latest.relayStart;
-  // An empty block only means something as "drop this request's changes".
-  if (!parsed.ops.length && !canReplace) return { kind: 'message-only', parsed };
+  // An empty block only means something as "drop this request's changes"; one whose operations
+  // were all unusable is a broken block, never a revert.
+  if (!parsed.ops.length && (parsed.problems.length || !canReplace)) {
+    return { kind: 'message-only', parsed, cannotRevert: !parsed.problems.length && !!latest };
+  }
 
   let requestBase = current;
   let start = current;
@@ -527,10 +593,12 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
 
   const applyAt = (from: TripSnapshot) => {
     const r = applyRelayOps(from, parsed.ops!);
-    return { ...r, trip: withResearch(r.trip, current) };
+    const trip = from === current ? r.trip : keepPlaceIds(r.trip, requestBase, current);
+    return { ...r, trip: withResearch(trip, current) };
   };
   const result = applyAt(start);
   const dropped = replaces && parsed.ops.length ? droppedChanges(requestBase, current, result.trip, parsed.ops) : [];
+  const onCurrent = dropped.length ? applyAt(current) : undefined;
   return {
     kind: 'apply',
     parsed,
@@ -539,10 +607,13 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
     confirm,
     replaces,
     replacesRev: latest?.relayRev,
+    replacesBroken: !!replaces && !!latest?.relayFix,
+    revertsRequest: !!replaces && !parsed.ops.length,
     result,
     opsFp,
     issues: [...parsed.problems, ...result.errors],
     dropped,
-    onCurrent: dropped.length ? applyAt(current) : undefined,
+    onCurrent,
+    onCurrentIssues: onCurrent ? [...parsed.problems, ...onCurrent.errors] : undefined,
   };
 }
