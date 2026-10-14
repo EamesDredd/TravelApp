@@ -68,13 +68,15 @@ export interface ChatMessage {
   undo?: TripSnapshot;
   undone?: boolean;
   sources?: SearchSource[];
-  /** Relay mode, user message: the trip version sent to the AI app. */
-  relay?: { base: string; snapshot: TripSnapshot };
-  /** Relay mode, assistant message: which sent version it answered, and the result's version. */
+  /** Relay mode, user message: the request's tag and the trip version it was sent from. */
+  relay?: { tag: string; fp: string };
+  /** Relay mode, assistant message: the request tag it answered and the trip version it produced. */
   relayBase?: string;
   relayResult?: string;
   /** Fingerprint of the applied operations, to spot the same reply pasted twice. */
   relayOps?: string;
+  /** Message the user can send back to the AI to fix problems in its block. */
+  relayFix?: string;
   at: number;
 }
 

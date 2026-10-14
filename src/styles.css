@@ -1365,3 +1365,9 @@ details.more > summary {
   padding: 0 9px;
   font-size: 13px;
 }
+
+/* Keep Leaflet's own z-indexes inside the map so dialogs opened above it stay on top. */
+.minimap,
+.route-map {
+  isolation: isolate;
+}

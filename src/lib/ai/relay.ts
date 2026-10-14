@@ -1,11 +1,16 @@
 /* "Relay" mode: no API key. The app hands the trip and the request to the
  * user's own Claude / ChatGPT app (share sheet or clipboard); the reply ends
- * with a ```travelplan block of operations that the app applies when the
- * user pastes the reply back. Pure functions only, so they are unit-tested. */
-import type { TripSnapshot } from '../../types';
+ * with a ```travelplan block of operations that the app applies to the
+ * current trip when the user pastes the reply back. Everything here is pure,
+ * so the decision logic is unit-tested; ChatPanel only asks and commits. */
+import type { ChatMessage, Trip, TripSnapshot } from '../../types';
+import { snapshotOf } from '../tripOps';
 import { applyToolCall, describeTrip, TOOL_DEFS } from './agentTools';
 
 export const RELAY_FENCE = 'travelplan';
+
+/** First line of every message the app sends out, so a pasted copy of it is recognised. */
+export const RELAY_MARKER = '〔旅遊行程規劃 App〕';
 
 const TOOL_NAMES = new Set(TOOL_DEFS.map((t) => t.name));
 
@@ -17,9 +22,9 @@ export interface RelayOp {
 export interface ParsedReply {
   /** The reply with the operations block removed, for the chat log. */
   message: string;
-  /** Version tag the AI echoed back, if any. */
+  /** The send tag the AI echoed back, if any. */
   base?: string;
-  /** Operations found in the reply; null when the reply has no block. */
+  /** Operations found in the reply; null when the reply has no usable block. */
   ops: RelayOp[] | null;
   /** Problems with the block itself (bad JSON, unknown tool...). */
   problems: string[];
@@ -52,10 +57,20 @@ export function opsFingerprint(ops: RelayOp[]): string {
   return fnv(JSON.stringify(ops));
 }
 
+/** A fresh tag for one send; replies echo it so the app knows which request they answer. */
+export function newRelayTag(): string {
+  const chars = 'abcdefghijkmnpqrstuvwxyz23456789';
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => chars[b % chars.length]).join('');
+}
+
+// ------------------------------------------------------------------ outgoing prompts
+
 const RULES = `- 「目前行程狀態」裡的資料以這則訊息為準。
 - 我要你安排、調整、新增或刪除時，直接給出修改區塊，不必先問我；只是詢問意見或資訊時，用文字回答就好，不要附修改區塊。
 - 依遠近安排時，用候選地點的座標把鄰近的地點排在同一天，依順路的動線排序、避免來回折返；考慮開放時間、停留時間、交通時間與用餐時段（早餐約 07:00–09:30、午餐 11:30–13:30、晚餐 17:30–20:00），填入合理的開始時間。
-- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時，在 set_day_plans 的項目裡用 new_spot，盡量附上地址與大略座標；不確定的座標寧可省略。App 會依名稱自動把同名的地點視為同一個，所以同一個新地點在不同天出現時，new_spot 的 name 要寫得一模一樣。
+- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時，在 set_day_plans 的項目裡用 new_spot，並一定要寫 name 和 category，盡量附上地址與大略座標；不確定的座標寧可省略。App 會依名稱把同名的地點視為同一個，所以同一個新地點在不同天出現時，new_spot 的 name 要寫得一模一樣。
 - add_candidates 只用在「加入候選但先不排進行程」的地點。
 - set_day_plans 會用你給的清單完整取代那一天，所以要列出那天所有項目，包含原本要保留的。
 - 一天不要排得太滿，保留彈性時間。
@@ -63,7 +78,8 @@ const RULES = `- 「目前行程狀態」裡的資料以這則訊息為準。
 
 // In relay mode the AI never sees the ids the app assigns, so new places are referenced by name.
 const RELAY_NOTES: Record<string, string> = {
-  add_candidates: '新增地點到候選清單（不會排進每日行程）。你看不到 App 給新地點的 id；要把新地點排進行程，請直接在 set_day_plans 用 new_spot。',
+  add_candidates:
+    '新增地點到候選清單（不會排進每日行程）。你看不到 App 給新地點的 id；要把新地點排進行程，請直接在 set_day_plans 用 new_spot。',
 };
 
 function toolDocs(): string {
@@ -73,9 +89,9 @@ function toolDocs(): string {
 }
 
 /** The whole message the user sends to their AI app. */
-export function buildRelayPrompt(trip: TripSnapshot, request: string, base: string, today = new Date()): string {
+export function buildRelayPrompt(trip: TripSnapshot, request: string, tag: string, today = new Date()): string {
   const example = JSON.stringify({
-    base,
+    base: tag,
     ops: [
       {
         tool: 'set_day_plans',
@@ -83,7 +99,8 @@ export function buildRelayPrompt(trip: TripSnapshot, request: string, base: stri
       },
     ],
   });
-  return `你是旅遊行程規劃助理。我正在用一個旅遊行程 App 安排旅程，下面附上 App 目前的行程資料。請依照我的需求回答；需要修改行程時，在回覆最後附上一個讓 App 自動套用的修改區塊。
+  return `${RELAY_MARKER}
+你是旅遊行程規劃助理。我正在用一個旅遊行程 App 安排旅程，下面附上 App 目前的行程資料。請依照我的需求回答；需要修改行程時，在回覆最後附上一個讓 App 自動套用的修改區塊。
 
 ## 我的需求
 ${request.trim()}
@@ -97,9 +114,9 @@ ${RULES}
 \`\`\`${RELAY_FENCE}
 ${example}
 \`\`\`
-3. "base" 固定寫 "${base}"（代表我這次傳給你的行程版本）；"ops" 依序列出要執行的指令。
+3. "base" 固定寫 "${tag}"（代表我這次的請求）；"ops" 依序列出要執行的指令。範例裡的 s_xxxx 只是示意，請換成真正的 spot_id。
 4. JSON 要完整有效：雙引號、不要註解、不要用「…」省略任何內容。
-5. 如果之後在這個對話裡我繼續要求修改，每次的區塊都要包含「相對於 base ${base} 的全部修改」（把之前提過、仍然要保留的修改一起列進去），因為 App 只會套用最新的那一個區塊。
+5. 之後在這個對話裡我如果繼續要求修改，新的區塊只要列出「這次要做的修改」就好；App 會把它套用在已經更新過的行程上。base 一樣寫 "${tag}"。
 
 ## 可用的指令
 ${toolDocs()}
@@ -107,9 +124,23 @@ ${toolDocs()}
 ${describeTrip(trip, today)}`;
 }
 
-/** True when pasted text is one of our own outgoing prompts rather than the AI's reply. */
+/** Wraps the place-research prompt for sending to the user's AI app. */
+export function buildRelaySearchPrompt(searchPrompt: string): string {
+  return `${RELAY_MARKER}\n${searchPrompt}`;
+}
+
+/** Message asking the AI to fix a block the app could not (fully) apply. */
+export function buildFixPrompt(tag: string | undefined, issues: string[]): string {
+  return `${RELAY_MARKER}
+你剛才的修改區塊有以下問題，App 沒有套用這些部分：
+${issues.map((i) => `- ${i}`).join('\n')}
+
+請修正後重新輸出完整的 \`\`\`${RELAY_FENCE} 區塊${tag ? `（base 一樣寫 "${tag}"）` : ''}。new_spot 一定要有 name 和 category（sight / breakfast / meal），spot_id 只能用行程資料裡出現過的 id。`;
+}
+
+/** True when pasted text is one of our own outgoing messages rather than the AI's reply. */
 export function looksLikeOwnPrompt(text: string): boolean {
-  return text.includes('## 我的需求') && text.includes('## 可用的指令');
+  return text.includes(RELAY_MARKER);
 }
 
 /** Links mentioned in a pasted reply, for the place's source list. */
@@ -162,60 +193,71 @@ function tryJson(raw: string): unknown {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** Fenced code blocks, in order: [lang, body, fullMatch]. */
-function fences(text: string): { lang: string; body: string; full: string }[] {
-  const out: { lang: string; body: string; full: string }[] = [];
+interface Fence {
+  lang: string;
+  body: string;
+  full: string;
+  start: number;
+  end: number;
+}
+
+/** Closed fenced code blocks, in order. */
+function fences(text: string): Fence[] {
+  const out: Fence[] = [];
   const re = /(^|\n)[ \t]*(`{3,}|~{3,})[ \t]*([\w-]*)[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) out.push({ lang: m[3].toLowerCase(), body: m[4], full: m[0] });
+  while ((m = re.exec(text))) {
+    out.push({ lang: m[3].toLowerCase(), body: m[4], full: m[0], start: m.index, end: m.index + m[0].length });
+  }
   return out;
 }
+
+const TRUNCATED = '修改區塊不完整（可能被截斷），請 AI 重新輸出完整區塊。';
 
 /** Finds the operations block in a pasted AI reply (whole reply, or just the block). */
 export function parseRelayReply(raw: string): ParsedReply {
   const text = raw.replace(/\r\n?/g, '\n').trim();
   const problems: string[] = [];
-  let found: { obj: Record<string, unknown>; remove?: string } | null = null;
+  let found: { obj: Record<string, unknown>; remove: string; end: number } | null = null;
 
-  // 1) Fenced blocks: prefer the last ```travelplan, then any block holding {"ops": [...]}.
+  // 1) Fenced blocks: the last ```travelplan wins; otherwise the last block holding {"ops": [...]}.
   const blocks = fences(text);
-  const ordered = [
-    ...blocks.filter((b) => b.lang === RELAY_FENCE).reverse(),
-    ...blocks.filter((b) => b.lang !== RELAY_FENCE).reverse(),
-  ];
-  for (const b of ordered) {
-    const start = b.body.indexOf('{');
-    const json = start >= 0 ? balancedObject(b.body, start) : null;
+  const lastPlan = blocks.filter((b) => b.lang === RELAY_FENCE).pop();
+  const candidates = lastPlan ? [lastPlan] : blocks.slice().reverse();
+  for (const b of candidates) {
+    const at = b.body.indexOf('{');
+    const json = at >= 0 ? balancedObject(b.body, at) : null;
     const v = json ? tryJson(json) : undefined;
     if (isObj(v) && Array.isArray(v.ops)) {
-      found = { obj: v, remove: b.full };
+      found = { obj: v, remove: b.full, end: b.end };
       break;
     }
-    if (b.lang === RELAY_FENCE) problems.push('修改區塊不是完整有效的 JSON（可能被截斷），請請 AI 重新輸出完整區塊。');
   }
+  if (lastPlan && !found) problems.push(TRUNCATED);
 
-  // 2) No usable fence (e.g. copied without the ``` markers): scan for {"base"…} / {"ops"…}.
-  if (!found) {
+  // 2) No fence at all (copied as plain text): scan for {"base"…} / {"ops"…}.
+  if (!found && !lastPlan) {
     const re = /\{\s*"(?:base|ops)"\s*:/g;
     let m: RegExpExecArray | null;
-    let last: { obj: Record<string, unknown>; remove: string } | null = null;
     while ((m = re.exec(text))) {
       const json = balancedObject(text, m.index);
       const v = json ? tryJson(json) : undefined;
-      if (json && isObj(v) && Array.isArray(v.ops)) last = { obj: v, remove: json };
-    }
-    if (last) {
-      found = last;
-      problems.length = 0;
+      if (json && isObj(v) && Array.isArray(v.ops)) found = { obj: v, remove: json, end: m.index + json.length };
     }
   }
 
-  if (!found && new RegExp(`(\`\`\`|~~~)\\s*${RELAY_FENCE}`).test(text) && !problems.length) {
-    problems.push('修改區塊不完整（可能被截斷），請請 AI 重新輸出完整區塊。');
+  // A travelplan block opened after the one we found but never closed means the AI's
+  // latest version was cut off: never fall back to the earlier, superseded block.
+  const opener = new RegExp(`(^|\\n)[ \\t]*(\`{3,}|~{3,})[ \\t]*${RELAY_FENCE}`, 'g');
+  let lastOpen = -1;
+  for (let m = opener.exec(text); m; m = opener.exec(text)) lastOpen = m.index;
+  if (lastOpen >= 0 && (!found || lastOpen >= found.end)) {
+    if (!problems.includes(TRUNCATED)) problems.push(TRUNCATED);
+    found = null;
   }
 
   let message = text;
-  if (found?.remove) message = message.replace(found.remove, '\n');
+  if (found) message = message.replace(found.remove, '\n');
   // Drop a dangling language tag left by "copy text" on some apps (e.g. "travelplan\n複製程式碼").
   message = message
     .replace(new RegExp(`(^|\\n)\\s*${RELAY_FENCE}\\s*(\\n|$)`, 'g'), '\n\n')
@@ -225,8 +267,7 @@ export function parseRelayReply(raw: string): ParsedReply {
   if (!found) return { message, ops: null, problems };
 
   const ops: RelayOp[] = [];
-  const rawOps = found.obj.ops as unknown[];
-  rawOps.forEach((op, i) => {
+  (found.obj.ops as unknown[]).forEach((op, i) => {
     if (!isObj(op) || typeof op.tool !== 'string') {
       problems.push(`第 ${i + 1} 個指令格式錯誤`);
       return;
@@ -262,4 +303,65 @@ export function applyRelayOps(start: TripSnapshot, ops: RelayOp[]): RelayApplyRe
     else errors.push(...lines.filter((l) => l.startsWith('錯誤：')).map((l) => l.slice(3)));
   }
   return { trip, summary, errors };
+}
+
+export type RelayDecision =
+  /** The clipboard held our own outgoing message. */
+  | { kind: 'own-prompt' }
+  | { kind: 'empty' }
+  /** The reply answers a request sent from another trip. */
+  | { kind: 'other-trip'; tripName: string }
+  /** This exact block was already applied (and not undone). */
+  | { kind: 'duplicate' }
+  /** No operations to apply: a discussion reply, or a broken block. */
+  | { kind: 'message-only'; parsed: ParsedReply }
+  | {
+      kind: 'apply';
+      parsed: ParsedReply;
+      /** The trip before applying, for undo. */
+      before: TripSnapshot;
+      /** Ask before applying: the request is unknown here, or the trip changed since it was sent. */
+      confirm: null | 'unknown-send' | 'edited-since-send';
+      result: RelayApplyResult;
+      opsFp: string;
+      /** Problems with the block plus operations that failed; the rest applied cleanly. */
+      issues: string[];
+    };
+
+/**
+ * Decides what pasting `raw` into `trip` should do. Operations always apply to the
+ * CURRENT trip (never an old snapshot), so follow-up replies build on earlier ones
+ * and nothing saved in between is lost.
+ */
+export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, 'name' | 'chat'>[]): RelayDecision {
+  if (looksLikeOwnPrompt(raw)) return { kind: 'own-prompt' };
+  const parsed = parseRelayReply(raw);
+  if (!parsed.message && !parsed.ops && !parsed.problems.length) return { kind: 'empty' };
+  if (!parsed.ops?.length) return { kind: 'message-only', parsed };
+
+  const opsFp = opsFingerprint(parsed.ops);
+  if (trip.chat.some((m) => m.relayOps === opsFp && !m.undone)) return { kind: 'duplicate' };
+
+  const sent: ChatMessage | undefined = parsed.base ? trip.chat.find((m) => m.relay?.tag === parsed.base) : undefined;
+  if (parsed.base && !sent) {
+    const other = otherTrips.find((t) => t.chat.some((m) => m.relay?.tag === parsed.base));
+    if (other) return { kind: 'other-trip', tripName: other.name };
+  }
+
+  const current = snapshotOf(trip);
+  const currentFp = tripFingerprint(current);
+  let confirm: null | 'unknown-send' | 'edited-since-send' = null;
+  if (!sent) {
+    confirm = 'unknown-send';
+  } else {
+    // Versions the trip may legitimately be at: as sent, or after any reply to this request that still stands.
+    const known = new Set([
+      sent.relay!.fp,
+      ...trip.chat.filter((m) => m.relayBase === parsed.base && m.relayResult && !m.undone).map((m) => m.relayResult!),
+    ]);
+    if (!known.has(currentFp)) confirm = 'edited-since-send';
+  }
+
+  const result = applyRelayOps(current, parsed.ops);
+  return { kind: 'apply', parsed, before: current, confirm, result, opsFp, issues: [...parsed.problems, ...result.errors] };
 }

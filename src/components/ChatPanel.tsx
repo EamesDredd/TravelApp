@@ -1,18 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { aiConfigured, chatSupportsWebSearch, FriendlyError, providerLabel, runChatTurn } from '../lib/ai';
-import {
-  applyRelayOps,
-  buildRelayPrompt,
-  looksLikeOwnPrompt,
-  opsFingerprint,
-  parseRelayReply,
-  tripFingerprint,
-} from '../lib/ai/relay';
-import { AI_APP_LINKS, copyText, readClipboard, sendToAiApp } from '../lib/handoff';
+import { buildFixPrompt, buildRelayPrompt, newRelayTag, planRelayApply, tripFingerprint } from '../lib/ai/relay';
+import { AI_APP_LINKS, copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { snapshotOf } from '../lib/tripOps';
 import { uid } from '../lib/util';
 import { getCurrentTrip, useCurrentTrip, useStore } from '../store';
-import type { ChatMessage, SearchSource, TripSnapshot } from '../types';
+import type { ChatMessage, SearchSource } from '../types';
 import { useUI } from '../ui';
 import { Markdown } from './Markdown';
 import { PasteModal } from './PasteModal';
@@ -58,7 +51,8 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
   const [input, setInput] = useState('');
   const [live, setLive] = useState<Live | null>(null);
   const [full, setFull] = useState(false);
-  const [lastPrompt, setLastPrompt] = useState<string | null>(null);
+  /** The last relay message prepared in this trip; recorded in the chat once it leaves the app. */
+  const [pending, setPending] = useState<PendingSend | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const ctrl = useRef<AbortController | null>(null);
   const log = useRef<HTMLDivElement>(null);
@@ -70,6 +64,9 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
   useEffect(() => {
     log.current?.scrollTo({ top: log.current.scrollHeight });
   }, [trip.chat.length, live?.text, live?.status, props.visible]);
+
+  // A prepared message belongs to the trip it was made from.
+  useEffect(() => setPending(null), [trip.id]);
 
   const resetInput = () => {
     setInput('');
@@ -152,83 +149,120 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
 
   // ---------------------------------------------------------------- relay (no key)
 
+  const recordSend = (p: PendingSend) => {
+    if (p.recorded || getCurrentTrip()?.id !== p.tripId) return;
+    appendChat({ id: uid('m'), role: 'user', text: p.text, relay: { tag: p.tag, fp: p.fp }, at: Date.now() });
+    resetInput();
+    setPending({ ...p, recorded: true });
+  };
+
   /** Called straight from the tap so the share sheet is allowed to open. */
   const sendRelay = async (text: string) => {
     const t = getCurrentTrip();
     if (!t) return;
     const snapshot = snapshotOf(t);
-    const base = tripFingerprint(snapshot);
-    const prompt = buildRelayPrompt(snapshot, text, base);
-    setLastPrompt(prompt);
-    const result = await sendToAiApp(prompt);
-    if (result === 'cancelled') return;
-    resetInput();
-    appendChat({ id: uid('m'), role: 'user', text, relay: { base, snapshot }, at: Date.now() });
+    const tag = newRelayTag();
+    const p: PendingSend = {
+      tripId: t.id,
+      text,
+      tag,
+      fp: tripFingerprint(snapshot),
+      prompt: buildRelayPrompt(snapshot, text, tag),
+      recorded: false,
+    };
+    setPending(p);
+    const result = await sendToAiApp(p.prompt);
+    if (result === 'shared' || result === 'copied') recordSend(p);
     if (result === 'copied') toast('已複製，請貼到 Claude 或 ChatGPT 送出');
     if (result === 'failed') toast('無法自動傳送，請按下方「複製內容」');
   };
 
+  const copyPending = async () => {
+    if (!pending) return;
+    if (await copyText(pending.prompt)) {
+      recordSend(pending);
+      toast('已複製，請貼到 Claude 或 ChatGPT 送出');
+    } else {
+      toast('複製失敗');
+    }
+  };
+
   const applyReply = (raw: string) => {
+    const st = useStore.getState();
     const t = getCurrentTrip();
     if (!t) return;
-    if (looksLikeOwnPrompt(raw)) {
-      toast('剪貼簿裡是要傳給 AI 的內容，請先在 AI App 複製它的回覆');
-      return;
-    }
-    const parsed = parseRelayReply(raw);
-    if (!parsed.message && !parsed.ops) {
-      toast('沒有讀到內容');
-      return;
-    }
-    const current = snapshotOf(t);
-    const currentFp = tripFingerprint(current);
-    const opsFp = parsed.ops?.length ? opsFingerprint(parsed.ops) : undefined;
-    if (opsFp && t.chat.some((m) => m.relayOps === opsFp && m.relayResult === currentFp && !m.undone)) {
-      toast('這則回覆已經套用過了');
-      return;
-    }
-    let start: TripSnapshot = current;
-    const notes: string[] = parsed.problems.map((p) => `⚠️ ${p}`);
+    const d = planRelayApply(raw, t, st.trips.filter((x) => x.id !== t.id));
+    const addReply = (msg: Partial<ChatMessage>) =>
+      appendChat({ id: uid('m'), role: 'assistant', text: '', at: Date.now(), ...msg });
 
-    if (parsed.ops?.length && parsed.base) {
-      const sent = [...t.chat].reverse().find((m) => m.relay?.base === parsed.base);
-      if (sent?.relay) {
-        // The AI's operations are relative to the version it was sent; apply them there.
-        const lastApplied = [...t.chat].reverse().find((m) => m.relayBase === parsed.base && m.relayResult);
-        const untouched = currentFp === parsed.base || currentFp === lastApplied?.relayResult;
+    switch (d.kind) {
+      case 'own-prompt':
+        toast('剪貼簿裡是要傳給 AI 的內容，請先在 AI App 複製它的回覆');
+        return;
+      case 'empty':
+        toast('沒有讀到內容');
+        return;
+      case 'other-trip':
+        alert(`這則回覆是「${d.tripName}」的，請切換到那個旅程再貼上。`);
+        return;
+      case 'duplicate':
+        toast('這則回覆已經套用過了');
+        return;
+      case 'message-only': {
+        const { parsed } = d;
+        if (parsed.problems.length) {
+          addReply({
+            text: parsed.message || '（AI 的回覆）',
+            actions: ['⚠️ 沒有套用任何修改', ...parsed.problems.map((p) => `⚠️ ${p}`)],
+            relayFix: buildFixPrompt(parsed.base, parsed.problems),
+          });
+          toast('修改區塊不完整，沒有套用');
+          return;
+        }
+        if (!confirm(`這段內容沒有行程修改區塊，要加入對話紀錄嗎？\n\n${preview(parsed.message)}`)) return;
+        addReply({ text: parsed.message });
+        toast('已加入對話紀錄');
+        return;
+      }
+      case 'apply': {
         if (
-          !untouched &&
-          !confirm('傳給 AI 之後，行程有其他變動。要以 AI 這次回覆的版本為準嗎？那些變動會被取代（之後可按「復原」）。')
+          d.confirm === 'unknown-send' &&
+          !confirm(`找不到這則回覆對應的傳送紀錄（可能來自其他裝置，或對話已清除）。\n要套用到目前的旅程「${t.name}」嗎？`)
         ) {
           return;
         }
-        start = sent.relay.snapshot;
-      } else {
-        notes.push('⚠️ 找不到這次回覆對應的傳送紀錄，已直接套用到目前的行程');
+        if (
+          d.confirm === 'edited-since-send' &&
+          !confirm('傳給 AI 之後，行程有其他變動。AI 的修改可能會覆蓋那幾天的安排，要繼續嗎？（之後可按「復原」）')
+        ) {
+          return;
+        }
+        let result = d.result.trip;
+        let applied = true;
+        if (d.issues.length) {
+          const list = d.issues.slice(0, 5).map((i) => `・${i}`).join('\n');
+          applied =
+            d.result.summary.length > 0 &&
+            confirm(`AI 的修改有 ${d.issues.length} 個問題：\n${list}\n\n要先套用沒問題的部分嗎？（也可以把問題傳回給 AI 修正）`);
+          if (!applied) result = d.before;
+        }
+        const resultFp = tripFingerprint(result);
+        const changed = resultFp !== tripFingerprint(d.before);
+        if (changed) replaceSnapshot(result);
+        const actions = changed ? [...d.result.summary] : ['⚠️ 沒有套用任何修改'];
+        if (changed && !actions.length) actions.push('已更新行程');
+        actions.push(...d.issues.map((i) => `⚠️ ${i}`));
+        addReply({
+          text: d.parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
+          actions,
+          ...(d.parsed.base ? { relayBase: d.parsed.base } : {}),
+          ...(changed ? { undo: d.before, relayResult: resultFp, relayOps: d.opsFp } : {}),
+          ...(d.issues.length ? { relayFix: buildFixPrompt(d.parsed.base, d.issues) } : {}),
+        });
+        toast(changed ? (d.issues.length ? '已套用部分修改' : '已套用 AI 的修改') : '沒有套用，可以把問題傳回給 AI 修正');
+        return;
       }
     }
-
-    let result = current;
-    const actions: string[] = [];
-    if (parsed.ops?.length) {
-      const r = applyRelayOps(start, parsed.ops);
-      result = r.trip;
-      actions.push(...r.summary, ...r.errors.map((e) => `⚠️ ${e}`));
-    }
-    actions.push(...notes);
-    const resultFp = tripFingerprint(result);
-    const changed = resultFp !== currentFp;
-    if (changed) replaceSnapshot(result);
-    appendChat({
-      id: uid('m'),
-      role: 'assistant',
-      text: parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
-      at: Date.now(),
-      ...(actions.length ? { actions } : {}),
-      ...(changed ? { undo: current, relayResult: resultFp, relayOps: opsFp } : {}),
-      ...(parsed.base ? { relayBase: parsed.base } : {}),
-    });
-    toast(changed ? '已套用 AI 的修改' : parsed.ops ? '這次回覆沒有要變更的內容' : '已加入對話紀錄');
   };
 
   const pasteReply = async () => {
@@ -336,11 +370,8 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           <button className="btn btn-sm btn-primary" onClick={pasteReply}>
             📋 貼上回覆
           </button>
-          {lastPrompt && (
-            <button
-              className="btn btn-sm"
-              onClick={async () => toast((await copyText(lastPrompt)) ? '已複製，請貼到 AI App' : '複製失敗')}
-            >
+          {pending && (
+            <button className="btn btn-sm" onClick={copyPending}>
               ⧉ 複製內容
             </button>
           )}
@@ -416,6 +447,16 @@ function Sources({ sources }: { sources: SearchSource[] }) {
   );
 }
 
+interface PendingSend {
+  tripId: string;
+  text: string;
+  tag: string;
+  fp: string;
+  prompt: string;
+  /** Already logged in the chat as sent. */
+  recorded: boolean;
+}
+
 function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
   if (m.role === 'user') {
     return (
@@ -430,20 +471,34 @@ function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
     <div className="bubble assistant">
       <Markdown text={m.text} />
       {m.sources && m.sources.length > 0 && <Sources sources={m.sources} />}
-      {m.actions && m.actions.length > 0 && (
+      {(!!m.actions?.length || !!m.undo || !!m.undone || !!m.relayFix) && (
         <div className="actions-box">
-          <ul>
-            {m.actions.map((a, i) => (
-              <li key={i}>{a.startsWith('⚠️') ? a : `✓ ${a}`}</li>
-            ))}
-          </ul>
-          {m.undo ? (
-            <button className="btn btn-sm" onClick={onUndo}>
-              ↶ 復原這次修改
-            </button>
-          ) : m.undone ? (
-            <span className="muted">已復原</span>
-          ) : null}
+          {m.actions && m.actions.length > 0 && (
+            <ul>
+              {m.actions.map((a, i) => (
+                <li key={i}>{a.startsWith('⚠️') ? a : `✓ ${a}`}</li>
+              ))}
+            </ul>
+          )}
+          <div className="row-wrap">
+            {m.undo ? (
+              <button className="btn btn-sm" onClick={onUndo}>
+                ↶ 復原這次修改
+              </button>
+            ) : m.undone ? (
+              <span className="muted">已復原</span>
+            ) : null}
+            {m.relayFix && (
+              <button
+                className="btn btn-sm"
+                onClick={async () =>
+                  useUI.getState().showToast((await copyText(m.relayFix!)) ? '已複製，貼回 AI 的同一個對話請它修正' : '複製失敗')
+                }
+              >
+                ⧉ 複製修正請求給 AI
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

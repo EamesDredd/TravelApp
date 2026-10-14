@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive, spotSearchPrompt } from '../lib/ai';
-import { extractSources, looksLikeOwnPrompt } from '../lib/ai/relay';
-import { readClipboard, sendToAiApp } from '../lib/handoff';
+import { buildRelaySearchPrompt, extractSources, looksLikeOwnPrompt } from '../lib/ai/relay';
+import { copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { hasCoords, spotRegion } from '../lib/geo';
 import { placeQuery, quickSearchLinks } from '../lib/maps';
 import { CATEGORIES, scheduledDays } from '../lib/tripOps';
@@ -153,22 +153,27 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [pasteOpen, setPasteOpen] = useState(false);
+  const [copyFallback, setCopyFallback] = useState<string | null>(null);
   const ready = aiConfigured(settings);
   const toast = useUI.getState().showToast;
 
   // Without an API key: ask the user's own Claude / ChatGPT app, then paste its answer back.
   const relayAsk = async () => {
-    const r = await sendToAiApp(spotSearchPrompt(spot, trip.destination, true));
+    const prompt = buildRelaySearchPrompt(spotSearchPrompt(spot, trip.destination, true));
+    const r = await sendToAiApp(prompt);
+    setCopyFallback(r === 'failed' ? prompt : null);
     if (r === 'copied') toast('已複製，請貼到 Claude 或 ChatGPT 送出');
-    if (r === 'failed') toast('無法傳送，請手動複製');
+    if (r === 'failed') toast('無法自動傳送，請按「複製查詢內容」');
   };
   const saveReply = (text: string) => {
     if (looksLikeOwnPrompt(text)) {
-      toast('剪貼簿裡不是 AI 的回覆');
+      toast('剪貼簿裡是要傳給 AI 的內容，請先複製 AI 的回覆');
       return;
     }
     const summary = text.replace(/\r\n?/g, '\n').trim();
     if (!summary) return;
+    const replace = spot.search ? '（會取代原本的查詢結果）' : '';
+    if (!confirm(`把這段內容存成「${spot.name}」的查詢結果嗎？${replace}\n\n${preview(summary)}`)) return;
     updateSpot(spot.id, {
       search: { summary, sources: extractSources(summary), provider: 'Claude / ChatGPT App', at: Date.now() },
     });
@@ -220,6 +225,14 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
             <button className="btn btn-sm" onClick={relayPaste}>
               📋 貼上回覆存檔
             </button>
+            {copyFallback && (
+              <button
+                className="btn btn-sm"
+                onClick={async () => toast((await copyText(copyFallback)) ? '已複製，請貼到 Claude 或 ChatGPT 送出' : '複製失敗')}
+              >
+                ⧉ 複製查詢內容
+              </button>
+            )}
           </div>
         )}
         {busy && (

@@ -25,6 +25,8 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+let sharing = false;
+
 /**
  * Phones get the share sheet (which lists the Claude and ChatGPT apps);
  * desktops get the text copied. Must be called straight from a tap/click.
@@ -32,12 +34,18 @@ export async function copyText(text: string): Promise<boolean> {
 export async function sendToAiApp(text: string): Promise<SendResult> {
   const phone = window.matchMedia?.('(pointer: coarse)').matches ?? false;
   if (phone && typeof navigator.share === 'function') {
+    // A second tap while the sheet is still opening must not fall through to copying.
+    if (sharing) return 'cancelled';
+    sharing = true;
     try {
       await navigator.share({ text });
       return 'shared';
     } catch (err) {
-      if ((err as DOMException).name === 'AbortError') return 'cancelled';
-      // Some targets reject long text; fall through to copying.
+      const name = (err as DOMException).name;
+      if (name === 'AbortError' || name === 'InvalidStateError') return 'cancelled';
+      // Some targets reject long text; try copying instead (may fail without a fresh tap).
+    } finally {
+      sharing = false;
     }
   }
   return (await copyText(text)) ? 'copied' : 'failed';
@@ -51,6 +59,12 @@ export async function readClipboard(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** First characters of a long text, for confirmation dialogs. */
+export function preview(text: string, max = 120): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
 export const AI_APP_LINKS = [
