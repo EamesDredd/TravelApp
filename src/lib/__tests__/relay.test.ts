@@ -62,6 +62,7 @@ function commit(t: Trip, d: RelayDecision): Trip {
         relayRev: d.parsed.rev,
         relayResult: resultFp,
         relayOps: d.opsFp,
+        relayStart: d.requestBase,
         undo: d.before,
       },
     ],
@@ -147,9 +148,34 @@ describe('parseRelayReply', () => {
     expect(r.message).toBe('說明文字\n\n祝旅途愉快');
   });
 
-  it('uses the last block when the reply has several', () => {
-    const first = [{ tool: 'update_trip', input: { name: '舊' } }];
-    expect(parseRelayReply(`${block({ base: 'b', ops: first })}\n修正：\n${block({ base: 'b', ops })}`).ops).toEqual(ops);
+  it('merges blocks of the same version and keeps only the newest version', () => {
+    const first = [{ tool: 'update_trip', input: { name: '新名稱' } }];
+    const merged = parseRelayReply(`先改名：\n${block({ base: 'b', ops: first })}\n再排：\n${block({ base: 'b', ops })}`);
+    expect(merged.ops).toEqual([...first, ...ops]);
+    expect(merged.notes.join()).toContain('2 個修改區塊');
+    expect(merged.message).toBe('先改名：\n\n再排：');
+    const versions = parseRelayReply(`${block({ base: 'b', rev: 1, ops: first })}\n修正版：\n${block({ base: 'b', rev: 2, ops })}`);
+    expect(versions.ops).toEqual(ops);
+    expect(versions.rev).toBe(2);
+  });
+
+  it('does not mistake an example in prose for a broken block', () => {
+    const r = parseRelayReply('這次只是建議，所以不附修改區塊。需要的話我會附上 {"base": "abc", "rev": 1, "ops": [...]} 這樣的區塊。');
+    expect(r).toMatchObject({ ops: null, problems: [] });
+  });
+
+  it('repairs trailing commas and non-breaking spaces, and names invalid JSON as such', () => {
+    const fixed = parseRelayReply('```travelplan\n{\u00a0"base":"b","ops":[{"tool":"update_trip","input":{"name":"新",},},],}\n```');
+    expect(fixed.ops).toEqual([{ tool: 'update_trip', input: { name: '新' } }]);
+    const bad = parseRelayReply('```travelplan\n{"base":"b", // 註解\n"ops":[]}\n```');
+    expect(bad.ops).toBeNull();
+    expect(bad.problems.join()).toContain('JSON 格式錯誤');
+  });
+
+  it('drops copy-button labels from the message', () => {
+    const r = parseRelayReply(`說明\ntravelplan\n複製程式碼\n${JSON.stringify({ base: 'b', ops })}\n祝順利`);
+    expect(r.ops).toEqual(ops);
+    expect(r.message).toBe('說明\n\n祝順利');
   });
 
   it('never falls back to an earlier block when the latest one is cut off', () => {
@@ -270,6 +296,99 @@ describe('planRelayApply', () => {
     if (d.kind !== 'apply') throw new Error(d.kind);
     expect(d.confirm).toBeNull();
     expect(dayIds(d.result.trip)).toEqual([['s_kiyo'], ['s_inar'], ['s_kink']]);
+  });
+
+  it('third and later versions replace from the original starting point', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo'), day(3, 's_kink')), t, []));
+    t = commit(t, planRelayApply(planRev('tag001', 2, day(1, 's_kiyo'), day(3)), t, []));
+    expect(dayIds(t)).toEqual([['s_kiyo'], ['s_inar'], []]);
+    const d = planRelayApply(planRev('tag001', 3, day(1, 's_kiyo', 's_inar'), day(3)), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.confirm).toBeNull();
+    expect(dayIds(d.result.trip)).toEqual([['s_kiyo', 's_inar'], ['s_inar'], []]);
+  });
+
+  it('a place deleted only by an early version stays after later versions', () => {
+    const del = (rev: number, keep: boolean, ...ids: string[]) =>
+      `好\n${block({
+        base: 'tag001',
+        rev,
+        ops: keep ? [{ tool: 'set_day_plans', input: { days: [day(1, ...ids)] } }] : [{ tool: 'update_spots', input: { updates: [{ spot_id: 's_kink', delete: true }] } }],
+      })}`;
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(del(1, false), t, []));
+    t = commit(t, planRelayApply(del(2, true, 's_kiyo'), t, []));
+    t = commit(t, planRelayApply(del(3, true, 's_kiyo', 's_inar'), t, []));
+    expect(t.spots.some((s) => s.id === 's_kink')).toBe(true);
+  });
+
+  it('flags a follow-up that silently drops earlier changes and offers applying on top', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo'), day(3, 's_kink')), t, []));
+    const d = planRelayApply(planRev('tag001', 2, day(2, 's_inar', 's_kiyo')), t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.dropped).toEqual(['第 1、3 天會回到原本的安排']);
+    expect(dayIds(d.result.trip)).toEqual([[], ['s_inar', 's_kiyo'], []]);
+    expect(dayIds(d.onCurrent!.trip)).toEqual([['s_kiyo'], ['s_inar', 's_kiyo'], ['s_kink']]);
+  });
+
+  it('a cumulative version that re-lists everything drops nothing', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []));
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo'), day(2, 's_inar', 's_kink')), t, []);
+    expect(d.kind === 'apply' && d.dropped).toEqual([]);
+  });
+
+  it('reports places of the earlier version that would disappear', () => {
+    let t = sent(trip(), 'tag001');
+    const withLunch = `好\n${block({ base: 'tag001', rev: 1, ops: [{ tool: 'add_candidates', input: { spots: [{ name: '奧丹', category: 'meal' }] } }] })}`;
+    t = commit(t, planRelayApply(withLunch, t, []));
+    const d = planRelayApply(planRev('tag001', 2, day(1, 's_kiyo')), t, []);
+    expect(d.kind === 'apply' && d.dropped).toEqual(['先前新增的「奧丹」會被移除']);
+  });
+
+  it('keeps research saved on a place an earlier version created', () => {
+    const lunch = { name: '奧丹 清水', category: 'meal' };
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(`好\n${block({ base: 'tag001', rev: 1, ops: [{ tool: 'set_day_plans', input: { days: [{ day: 1, items: [{ new_spot: lunch }] }] } }] })}`, t, []));
+    t = { ...t, spots: t.spots.map((s) => (s.name === '奧丹 清水' ? { ...s, search: { summary: '湯豆腐', sources: [], provider: 'p', at: 1 } } : s)) };
+    const d = planRelayApply(
+      `好\n${block({ base: 'tag001', rev: 2, ops: [{ tool: 'set_day_plans', input: { days: [{ day: 1, items: [{ new_spot: lunch }, { spot_id: 's_kiyo' }] }] } }] })}`,
+      t,
+      [],
+    );
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.replaces).toBeDefined();
+    expect(d.result.trip.spots.find((s) => s.name === '奧丹 清水')?.search?.summary).toBe('湯豆腐');
+  });
+
+  it('an empty block undoes the request when its reply is current, and is only a message otherwise', () => {
+    let t = sent(trip(), 'tag001');
+    const empty = `算了，維持原本的。\n${block({ base: 'tag001', rev: 2, ops: [] })}`;
+    expect(planRelayApply(empty, t, []).kind).toBe('message-only');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []));
+    const d = planRelayApply(empty, t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(dayIds(d.result.trip)).toEqual([[], ['s_inar'], []]);
+  });
+
+  it('a version with problems is still flagged as replacing, so the caller can keep the clean one', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 1, day(3, 's_kink')), t, []));
+    const broken = `好\n${block({ base: 'tag001', rev: 2, ops: [{ tool: 'set_day_plans', input: { days: [day(1, 's_kiyo'), { day: 3, items: [{ new_spot: { name: '無類別' } }] }] } }] })}`;
+    const d = planRelayApply(broken, t, []);
+    if (d.kind !== 'apply') throw new Error(d.kind);
+    expect(d.replaces).toBeDefined();
+    expect(d.issues.length).toBe(1);
+  });
+
+  it('an older version after hand edits warns about the edits, not about switching versions', () => {
+    let t = sent(trip(), 'tag001');
+    t = commit(t, planRelayApply(planRev('tag001', 2, day(1, 's_kink')), t, []));
+    t = { ...t, days: t.days.map((d, i) => (i === 2 ? { ...d, items: [{ id: 'm', spotId: 's_kiyo' }] } : d)) };
+    const d = planRelayApply(planRev('tag001', 1, day(1, 's_kiyo')), t, []);
+    expect(d.kind === 'apply' && d.confirm).toBe('edited-after-reply');
   });
 
   it('asks before switching back to an older version', () => {

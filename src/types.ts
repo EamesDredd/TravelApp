@@ -79,6 +79,8 @@ export interface ChatMessage {
   relayFix?: string;
   /** Block version (rev) this reply carried. */
   relayRev?: number;
+  /** The trip before this request's first applied reply; later replies to the request apply on top of it. */
+  relayStart?: TripSnapshot;
   /** A later reply to the same request replaced this one. */
   superseded?: boolean;
   at: number;

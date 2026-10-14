@@ -30,6 +30,8 @@ export interface ParsedReply {
   ops: RelayOp[] | null;
   /** Problems with the block itself (bad JSON, unknown tool...). */
   problems: string[];
+  /** Informational lines about how the reply was read (e.g. several blocks merged). */
+  notes: string[];
 }
 
 function fnv(data: string): string {
@@ -183,8 +185,10 @@ function balancedObject(text: string, start: number): string | null {
   return null;
 }
 
+/** JSON.parse with repairs for what chat apps commonly produce: smart quotes, trailing commas. */
 function tryJson(raw: string): unknown {
-  const attempts = [raw, raw.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")];
+  const quotes = raw.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  const attempts = [raw, quotes, quotes.replace(/,(\s*[}\]])/g, '$1')];
   for (const a of attempts) {
     try {
       return JSON.parse(a);
@@ -200,6 +204,7 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object
 interface Fence {
   lang: string;
   body: string;
+  bodyAt: number;
   full: string;
   start: number;
   end: number;
@@ -208,79 +213,148 @@ interface Fence {
 /** Closed fenced code blocks, in order. */
 function fences(text: string): Fence[] {
   const out: Fence[] = [];
-  const re = /(^|\n)[ \t]*(`{3,}|~{3,})[ \t]*([\w-]*)[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/g;
+  const re = /(^|\n)([ \t]*(`{3,}|~{3,})[ \t]*([\w-]*)[^\n]*\n)([\s\S]*?)\n[ \t]*\3[ \t]*(?=\n|$)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
-    out.push({ lang: m[3].toLowerCase(), body: m[4], full: m[0], start: m.index, end: m.index + m[0].length });
+    const start = m.index + m[1].length;
+    out.push({
+      lang: m[4].toLowerCase(),
+      body: m[5],
+      bodyAt: start + m[2].length,
+      full: m[0].slice(m[1].length),
+      start,
+      end: m.index + m[0].length,
+    });
   }
   return out;
 }
 
 const TRUNCATED = '修改區塊不完整（可能被截斷），請 AI 重新輸出完整區塊。';
+const BAD_JSON = '修改區塊的 JSON 格式錯誤（例如多餘的逗號或註解），請 AI 重新輸出。';
+const NO_OPS = '修改區塊格式不正確（缺少 ops 清單），請 AI 重新輸出。';
 
 /** Where a block object can start: {"base": …, {"ops": … or {"rev": … (straight or smart quotes). */
 const BLOCK_START = /\{\s*["“](?:base|ops|rev)["”]\s*:/g;
+/** Labels some apps leave behind when a code block is copied as plain text. */
+const COPY_LABEL = /^\s*(travelplan|json|複製程式碼|複製代碼|复制代码|copy code|copy|コピーする)\s*$/i;
+
+interface Candidate {
+  /** Where the JSON starts (or where it should have started). */
+  at: number;
+  /** Text to drop from the chat message. */
+  remove: string;
+  json: string | null;
+}
+
+interface Block {
+  at: number;
+  obj: Record<string, unknown>;
+  rev?: number;
+}
+
+function revOf(obj: Record<string, unknown>): number | undefined {
+  const n = Number(obj.rev);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
 
 /**
- * Finds the operations block in a pasted AI reply (the whole reply, just the block, fenced
- * or copied as plain text). The LAST block in the reply is the AI's latest word: if it is
- * cut off, nothing is applied rather than falling back to an earlier, superseded block.
+ * Finds the operations block(s) in a pasted AI reply: the whole reply or just the block,
+ * fenced or copied as plain text. If the AI's last block is cut off or broken, nothing is
+ * applied rather than falling back to an earlier, superseded block.
  */
 export function parseRelayReply(raw: string): ParsedReply {
-  const text = raw.replace(/\r\n?/g, '\n').trim();
+  const text = raw.replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ').trim();
   const problems: string[] = [];
-  let found: { obj: Record<string, unknown>; at: number; json: string } | null = null;
+  const notes: string[] = [];
+  const cands: Candidate[] = [];
+  const allFences = fences(text);
+  const inFence = (i: number) => allFences.some((f) => f.start <= i && i < f.end);
 
-  const starts = [...text.matchAll(BLOCK_START)].map((m) => m.index);
-  if (starts.length) {
-    const at = starts[starts.length - 1];
-    const json = balancedObject(text, at);
+  // 1) Closed fences: ```travelplan always; other fences only when they hold a block.
+  for (const f of allFences) {
+    const bs = new RegExp(BLOCK_START.source).exec(f.body);
+    if (f.lang !== RELAY_FENCE && !bs) continue;
+    const local = bs ? bs.index : f.body.indexOf('{');
+    cands.push({ at: f.bodyAt + Math.max(local, 0), remove: f.full, json: local >= 0 ? balancedObject(f.body, local) : null });
+  }
+  // 2) A travelplan fence that never closes (the reply was cut off, or the closing ``` was lost).
+  for (const m of text.matchAll(new RegExp(`(^|\\n)[ \\t]*(\`{3,}|~{3,})[ \\t]*${RELAY_FENCE}[^\\n]*`, 'gi'))) {
+    const at = m.index + m[1].length;
+    if (inFence(at)) continue;
+    const brace = text.indexOf('{', at);
+    const json = brace >= 0 ? balancedObject(text, brace) : null;
+    cands.push({ at: brace >= 0 ? brace : at, remove: json ? text.slice(at, brace + json.length) : text.slice(at), json });
+  }
+  // 3) Copied as plain text: a bare "travelplan" label line, then the JSON.
+  for (const m of text.matchAll(new RegExp(`(^|\\n)[ \\t]*${RELAY_FENCE}[ \\t]*(?=\\n|$)`, 'gi'))) {
+    const at = m.index + m[1].length;
+    if (inFence(at)) continue;
+    const brace = text.indexOf('{', at);
+    const json = brace >= 0 ? balancedObject(text, brace) : null;
+    cands.push({ at: brace >= 0 ? brace : at, remove: json ? text.slice(at, brace + json.length) : text.slice(at), json });
+  }
+  // 4) Bare JSON objects elsewhere. Without any marked block, only a complete, valid one counts
+  //    (an example written in prose is never mistaken for a broken block). Next to marked blocks,
+  //    one that never closes means the AI's later block was cut off (e.g. an unclosed ```json fence).
+  const strict = cands.length > 0;
+  const covered = (i: number) => inFence(i) || cands.some((c) => c.json && c.at <= i && i < c.at + c.json.length);
+  for (const m of text.matchAll(BLOCK_START)) {
+    if (covered(m.index)) continue;
+    const json = balancedObject(text, m.index);
     const v = json ? tryJson(json) : undefined;
-    if (json && isObj(v) && Array.isArray(v.ops)) found = { obj: v, at, json };
-    else problems.push(json && isObj(v) ? '修改區塊格式不正確（缺少 ops 清單），請 AI 重新輸出。' : TRUNCATED);
+    if (json && isObj(v) && Array.isArray(v.ops)) cands.push({ at: m.index, remove: json, json });
+    else if (strict && !json) cands.push({ at: m.index, remove: text.slice(m.index), json: null });
   }
 
-  // A travelplan fence or tag line after the block we found (or with none found) means the
-  // AI's latest block never arrived intact.
-  const markers = [
-    ...text.matchAll(new RegExp(`(^|\\n)[ \\t]*(\`{3,}|~{3,})[ \\t]*${RELAY_FENCE}`, 'gi')),
-    ...text.matchAll(new RegExp(`(^|\\n)[ \\t]*${RELAY_FENCE}[ \\t]*(?=\\n|$)`, 'gi')),
-  ].map((m) => m.index);
-  const lastMarker = markers.length ? Math.max(...markers) : -1;
-  if (lastMarker >= 0 && (!found || lastMarker > found.at)) {
-    found = null;
-    if (!problems.length) problems.push(TRUNCATED);
+  cands.sort((a, b) => a.at - b.at);
+  const blocks: Block[] = [];
+  let lastFailure: { at: number; reason: string } | null = null;
+  for (const c of cands) {
+    const v = c.json ? tryJson(c.json) : undefined;
+    if (isObj(v) && Array.isArray(v.ops)) blocks.push({ at: c.at, obj: v, rev: revOf(v) });
+    else lastFailure = { at: c.at, reason: !c.json ? TRUNCATED : isObj(v) ? NO_OPS : BAD_JSON };
+  }
+  const lastValid = blocks.length ? blocks[blocks.length - 1].at : -1;
+  if (lastFailure && lastFailure.at > lastValid) {
+    problems.push(lastFailure.reason);
+    blocks.length = 0;
   }
 
   let message = text;
-  if (found) {
-    const fence = fences(text).find((b) => b.start <= found!.at && found!.at < b.end);
-    message = message.replace(fence ? fence.full : found.json, '\n');
-  }
-  // Drop a dangling language tag left by "copy text" on some apps (e.g. "travelplan\n複製程式碼").
+  for (const c of cands) message = message.replace(c.remove, '\n');
   message = message
-    .replace(new RegExp(`(^|\\n)\\s*${RELAY_FENCE}\\s*(\\n|$)`, 'gi'), '\n\n')
+    .split('\n')
+    .filter((l) => !COPY_LABEL.test(l))
+    .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-  if (!found) return { message, ops: null, problems };
+  if (!blocks.length) return { message, ops: null, problems, notes };
+
+  // Several blocks: a higher rev supersedes; blocks of the same rev are parts of one answer.
+  const revs = blocks.map((b) => b.rev).filter((r): r is number => r !== undefined);
+  const top = revs.length ? Math.max(...revs) : undefined;
+  const chosen = top === undefined ? blocks : blocks.filter((b) => b.rev === top);
+  if (chosen.length > 1) notes.push(`回覆裡有 ${chosen.length} 個修改區塊，已依序合併套用`);
+  if (chosen.length < blocks.length) notes.push(`只套用最新版本（第 ${top} 版）的修改區塊`);
 
   const ops: RelayOp[] = [];
-  (found.obj.ops as unknown[]).forEach((op, i) => {
-    if (!isObj(op) || typeof op.tool !== 'string') {
-      problems.push(`第 ${i + 1} 個指令格式錯誤`);
-      return;
-    }
-    if (!TOOL_NAMES.has(op.tool)) {
-      problems.push(`未知的指令：${op.tool}`);
-      return;
-    }
-    ops.push({ tool: op.tool, input: op.input });
-  });
-  const base = typeof found.obj.base === 'string' && found.obj.base.trim() ? found.obj.base.trim() : undefined;
-  const revNum = Number(found.obj.rev);
-  const rev = Number.isInteger(revNum) && revNum > 0 ? revNum : undefined;
-  return { message, base, rev, ops, problems };
+  chosen.forEach((b) =>
+    (b.obj.ops as unknown[]).forEach((op, i) => {
+      if (!isObj(op) || typeof op.tool !== 'string') {
+        problems.push(`第 ${i + 1} 個指令格式錯誤`);
+        return;
+      }
+      if (!TOOL_NAMES.has(op.tool)) {
+        problems.push(`未知的指令：${op.tool}`);
+        return;
+      }
+      ops.push({ tool: op.tool, input: op.input });
+    }),
+  );
+  const last = chosen[chosen.length - 1].obj;
+  const base = typeof last.base === 'string' && last.base.trim() ? last.base.trim() : undefined;
+  return { message, base, rev: top, ops, problems, notes };
 }
 
 // ------------------------------------------------------------------ applying
@@ -315,7 +389,7 @@ export type RelayConfirm =
   | 'edited-since-send'
   /** A reply to this request was applied, but the trip changed again afterwards. */
   | 'edited-after-reply'
-  /** This block is an older version than the one already applied. */
+  /** This block is an older version than the one it would replace. */
   | 'older-version';
 
 export type RelayDecision =
@@ -326,43 +400,91 @@ export type RelayDecision =
   | { kind: 'other-trip'; tripName: string }
   /** This exact block is already what the trip shows. */
   | { kind: 'duplicate' }
-  /** No operations to apply: a discussion reply, or a broken block. */
+  /** No operations to apply: a discussion reply, an empty block, or a broken block. */
   | { kind: 'message-only'; parsed: ParsedReply }
   | {
       kind: 'apply';
       parsed: ParsedReply;
       /** The trip right now, for undo. */
       before: TripSnapshot;
+      /** The trip as it was before this request's first applied reply; replies replace each other on top of it. */
+      requestBase: TripSnapshot;
       confirm: RelayConfirm | null;
       /** Id of the earlier reply to the same request that this one replaces, if any. */
       replaces?: string;
-      /** Version number of the block it replaces, for the confirm text. */
       replacesRev?: number;
       result: RelayApplyResult;
       opsFp: string;
-      /** Problems with the block plus operations that failed; the rest applied cleanly. */
+      /** Problems with the block plus operations that failed. */
       issues: string[];
+      /**
+       * When replacing: changes of the earlier reply that this block quietly drops (days that go back
+       * to how they were, places that disappear), and the alternative of applying it on top instead.
+       */
+      dropped: string[];
+      onCurrent?: RelayApplyResult;
     };
 
-/** Keeps place research saved since `base` was taken (it is not part of the plan). */
-function withCurrentResearch(base: TripSnapshot, current: TripSnapshot): TripSnapshot {
-  const research = new Map(current.spots.filter((s) => s.search).map((s) => [s.id, s.search]));
-  return { ...base, spots: base.spots.map((s) => (research.has(s.id) ? { ...s, search: research.get(s.id) } : s)) };
+const nameKey = (n: string) => n.replace(/\s+/g, '').toLowerCase();
+
+/** Keeps place research saved since `base` was taken (it is not part of the plan), matching by id or name. */
+function withResearch(target: TripSnapshot, current: TripSnapshot): TripSnapshot {
+  const byId = new Map(current.spots.filter((s) => s.search).map((s) => [s.id, s.search]));
+  const byName = new Map(current.spots.filter((s) => s.search).map((s) => [nameKey(s.name), s.search]));
+  return {
+    ...target,
+    spots: target.spots.map((s) => (s.search ? s : { ...s, search: byId.get(s.id) ?? byName.get(nameKey(s.name)) ?? s.search })),
+  };
+}
+
+/** A day described by place names (new places get new ids each time a block is applied). */
+function daySig(t: TripSnapshot, i: number): string {
+  const d = t.days[i];
+  if (!d) return '∅';
+  const names = new Map(t.spots.map((s) => [s.id, s.name]));
+  return JSON.stringify([d.title ?? '', d.items.map((it) => [names.get(it.spotId) ?? it.spotId, it.time ?? '', it.note ?? ''])]);
+}
+
+function daysMentioned(ops: RelayOp[]): Set<number> {
+  const out = new Set<number>();
+  for (const op of ops) {
+    const days = isObj(op.input) && Array.isArray(op.input.days) ? op.input.days : [];
+    for (const d of days) if (isObj(d) && Number.isInteger(Number(d.day))) out.add(Number(d.day));
+  }
+  return out;
+}
+
+/** What the earlier reply changed (base → current) that the new result puts back as it was. */
+function droppedChanges(base: TripSnapshot, current: TripSnapshot, result: TripSnapshot, ops: RelayOp[]): string[] {
+  const mentioned = daysMentioned(ops);
+  const out: string[] = [];
+  const n = Math.max(base.days.length, current.days.length, result.days.length);
+  const days: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const before = daySig(base, i);
+    if (daySig(current, i) !== before && daySig(result, i) === before && !mentioned.has(i + 1)) days.push(i + 1);
+  }
+  if (days.length) out.push(`第 ${days.join('、')} 天會回到原本的安排`);
+  const keep = new Set(result.spots.map((s) => nameKey(s.name)));
+  const had = new Set(base.spots.map((s) => nameKey(s.name)));
+  const gone = current.spots.filter((s) => !had.has(nameKey(s.name)) && !keep.has(nameKey(s.name))).map((s) => s.name);
+  if (gone.length) out.push(`先前新增的「${gone.join('、')}」會被移除`);
+  return out;
 }
 
 /**
  * Decides what pasting `raw` into `trip` should do.
  *
  * Each block holds ALL changes for its request, so a newer reply to the same request
- * replaces the one applied before it: when nothing else changed since, the earlier
- * reply is rolled back first and the new block applied in its place. Otherwise blocks
- * apply to the current trip, and anything surprising is flagged for confirmation.
+ * replaces the one applied before: when that reply is still exactly what the trip shows,
+ * the trip goes back to how it was before the request and the new block applies there.
+ * Otherwise blocks apply to the current trip, and anything surprising asks first.
  */
 export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, 'name' | 'chat'>[]): RelayDecision {
   if (looksLikeOwnPrompt(raw)) return { kind: 'own-prompt' };
   const parsed = parseRelayReply(raw);
   if (!parsed.message && !parsed.ops && !parsed.problems.length) return { kind: 'empty' };
-  if (!parsed.ops?.length) return { kind: 'message-only', parsed };
+  if (!parsed.ops) return { kind: 'message-only', parsed };
 
   const sent: ChatMessage | undefined = parsed.base ? trip.chat.find((m) => m.relay?.tag === parsed.base) : undefined;
   if (parsed.base && !sent) {
@@ -380,33 +502,47 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
   const latest = applied[applied.length - 1];
   if (latest && latest.relayOps === opsFp && latest.relayResult === currentFp) return { kind: 'duplicate' };
 
+  const canReplace = !!latest && latest.relayResult === currentFp && !!latest.relayStart;
+  // An empty block only means something as "drop this request's changes".
+  if (!parsed.ops.length && !canReplace) return { kind: 'message-only', parsed };
+
+  let requestBase = current;
   let start = current;
   let confirm: RelayConfirm | null = null;
   let replaces: string | undefined;
   if (!sent) {
     confirm = 'unknown-send';
   } else if (latest) {
-    if (latest.relayResult === currentFp && latest.undo) {
-      start = withCurrentResearch(latest.undo, current);
+    if (canReplace) {
+      requestBase = latest.relayStart!;
+      start = withResearch(requestBase, current);
       replaces = latest.id;
+      if (parsed.rev && latest.relayRev && parsed.rev < latest.relayRev) confirm = 'older-version';
     } else {
       confirm = 'edited-after-reply';
     }
-    if (parsed.rev && latest.relayRev && parsed.rev < latest.relayRev) confirm = 'older-version';
   } else if (sent.relay!.fp !== currentFp) {
     confirm = 'edited-since-send';
   }
 
-  const result = applyRelayOps(start, parsed.ops);
+  const applyAt = (from: TripSnapshot) => {
+    const r = applyRelayOps(from, parsed.ops!);
+    return { ...r, trip: withResearch(r.trip, current) };
+  };
+  const result = applyAt(start);
+  const dropped = replaces && parsed.ops.length ? droppedChanges(requestBase, current, result.trip, parsed.ops) : [];
   return {
     kind: 'apply',
     parsed,
     before: current,
+    requestBase,
     confirm,
     replaces,
     replacesRev: latest?.relayRev,
     result,
     opsFp,
     issues: [...parsed.problems, ...result.errors],
+    dropped,
+    onCurrent: dropped.length ? applyAt(current) : undefined,
   };
 }

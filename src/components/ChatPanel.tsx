@@ -222,7 +222,13 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
             actions: ['⚠️ 沒有套用任何修改', ...parsed.problems.map((p) => `⚠️ ${p}`)],
             relayFix: buildFixPrompt(parsed.base, parsed.problems),
           });
-          toast('修改區塊不完整，沒有套用');
+          toast('修改區塊有問題，沒有套用');
+          return;
+        }
+        if (parsed.ops) {
+          // An empty block: the AI says there is nothing to change.
+          addReply({ text: parsed.message || '（AI 的回覆）', actions: ['ℹ️ AI 表示這次不需要修改行程'] });
+          toast('這則回覆沒有要修改行程');
           return;
         }
         const ok = confirm(
@@ -242,36 +248,63 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           'older-version': `這是較早的版本（第 ${d.parsed.rev} 版），目前套用的是第 ${d.replacesRev} 版。要改用這個版本嗎？`,
         } as const;
         if (d.confirm && !confirm(questions[d.confirm])) return;
+        const notes = d.parsed.notes.map((n) => `ℹ️ ${n}`);
 
-        let result = d.result.trip;
+        // A broken version never replaces one that applied cleanly; ask the AI to fix it instead.
+        if (d.replaces && d.issues.length) {
+          addReply({
+            text: d.parsed.message || '（AI 的回覆）',
+            actions: ['⚠️ 這一版有問題，先保留目前套用的版本', ...d.issues.map((i) => `⚠️ ${i}`), ...notes],
+            relayFix: buildFixPrompt(d.parsed.base, d.issues),
+            ...(d.parsed.base ? { relayBase: d.parsed.base } : {}),
+          });
+          toast('這一版有問題，先保留目前的版本');
+          return;
+        }
+
+        let apply = d.result;
+        let replaced = !!d.replaces;
+        if (d.dropped.length && d.onCurrent) {
+          const swap = confirm(
+            `這一版沒有包含先前套用的部分修改：\n${d.dropped.map((x) => `・${x}`).join('\n')}\n\n按「確定」照這一版取代；按「取消」可以改成套用在目前的行程上（保留先前的修改）。`,
+          );
+          if (!swap) {
+            if (!confirm('要把這一版套用在目前的行程上，保留先前的修改嗎？')) return;
+            apply = d.onCurrent;
+          }
+        }
+
+        let result = apply.trip;
         if (d.issues.length) {
           const list = d.issues.slice(0, 5).map((i) => `・${i}`).join('\n');
           const partial =
-            d.result.summary.length > 0 &&
+            apply.summary.length > 0 &&
             confirm(`AI 的修改有 ${d.issues.length} 個問題：\n${list}\n\n要先套用沒問題的部分嗎？（也可以把問題傳回給 AI 修正）`);
           if (!partial) result = d.before;
         }
         const resultFp = tripFingerprint(result);
         const changed = resultFp !== tripFingerprint(d.before);
+        if (!changed) replaced = false;
         if (changed) {
           replaceSnapshot(result);
           if (d.replaces) updateChat(d.replaces, { superseded: true });
         }
         const actions: string[] = changed
-          ? d.result.summary.length
-            ? [...d.result.summary]
+          ? apply.summary.length
+            ? [...apply.summary]
             : ['已更新行程']
           : d.issues.length
             ? ['⚠️ 沒有套用任何修改']
             : ['AI 的修改和目前行程相同，沒有變更'];
-        if (changed && d.replaces) actions.push('取代了這個請求先前套用的回覆');
-        actions.push(...d.issues.map((i) => `⚠️ ${i}`));
+        if (replaced) actions.push(apply === d.result ? '取代了這個請求先前套用的版本' : '套用在目前的行程上（保留先前的修改）');
+        if (replaced && apply === d.result && d.dropped.length) actions.push(...d.dropped);
+        actions.push(...d.issues.map((i) => `⚠️ ${i}`), ...notes);
         addReply({
           text: d.parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
           actions,
           ...(d.parsed.base ? { relayBase: d.parsed.base } : {}),
           ...(d.parsed.rev ? { relayRev: d.parsed.rev } : {}),
-          ...(changed ? { undo: d.before, relayResult: resultFp, relayOps: d.opsFp } : {}),
+          ...(changed ? { undo: d.before, relayResult: resultFp, relayOps: d.opsFp, relayStart: d.requestBase } : {}),
           ...(d.issues.length ? { relayFix: buildFixPrompt(d.parsed.base, d.issues) } : {}),
         });
         toast(
@@ -517,7 +550,7 @@ function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
           {m.actions && m.actions.length > 0 && (
             <ul>
               {m.actions.map((a, i) => (
-                <li key={i}>{a.startsWith('⚠️') ? a : `✓ ${a}`}</li>
+                <li key={i}>{a.startsWith('⚠️') || a.startsWith('ℹ️') ? a : `✓ ${a}`}</li>
               ))}
             </ul>
           )}
