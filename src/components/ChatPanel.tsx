@@ -1,11 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
 import { aiConfigured, chatSupportsWebSearch, FriendlyError, providerLabel, runChatTurn } from '../lib/ai';
+import {
+  applyRelayOps,
+  buildRelayPrompt,
+  looksLikeOwnPrompt,
+  opsFingerprint,
+  parseRelayReply,
+  tripFingerprint,
+} from '../lib/ai/relay';
+import { AI_APP_LINKS, copyText, readClipboard, sendToAiApp } from '../lib/handoff';
 import { snapshotOf } from '../lib/tripOps';
 import { uid } from '../lib/util';
 import { getCurrentTrip, useCurrentTrip, useStore } from '../store';
-import type { ChatMessage, SearchSource } from '../types';
+import type { ChatMessage, SearchSource, TripSnapshot } from '../types';
 import { useUI } from '../ui';
 import { Markdown } from './Markdown';
+import { PasteModal } from './PasteModal';
 
 const SUGGESTIONS = [
   '幫我按景點遠近安排各天行程',
@@ -48,22 +58,33 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
   const [input, setInput] = useState('');
   const [live, setLive] = useState<Live | null>(null);
   const [full, setFull] = useState(false);
+  const [lastPrompt, setLastPrompt] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
   const ctrl = useRef<AbortController | null>(null);
   const log = useRef<HTMLDivElement>(null);
-  const ready = aiConfigured(settings);
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  /** API key set: the app talks to the AI itself. Otherwise relay through the user's AI app. */
+  const direct = aiConfigured(settings);
+  const toast = useUI.getState().showToast;
 
   useEffect(() => {
     log.current?.scrollTo({ top: log.current.scrollHeight });
   }, [trip.chat.length, live?.text, live?.status, props.visible]);
 
-  const send = async (raw: string) => {
-    const text = raw.trim();
+  const resetInput = () => {
+    setInput('');
+    if (textarea.current) textarea.current.style.height = 'auto';
+  };
+
+  // ---------------------------------------------------------------- direct (API key)
+
+  const sendDirect = async (text: string) => {
     const t = getCurrentTrip();
-    if (!text || !t || props.running) return;
+    if (!t || props.running) return;
     const before = snapshotOf(t);
     const history = t.chat;
     const tripId = t.id;
-    setInput('');
+    resetInput();
     appendChat({ id: uid('m'), role: 'user', text, at: Date.now() });
     props.setRunning(true);
     setLive({ text: '', status: '思考中…' });
@@ -129,12 +150,108 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
     }
   };
 
+  // ---------------------------------------------------------------- relay (no key)
+
+  /** Called straight from the tap so the share sheet is allowed to open. */
+  const sendRelay = async (text: string) => {
+    const t = getCurrentTrip();
+    if (!t) return;
+    const snapshot = snapshotOf(t);
+    const base = tripFingerprint(snapshot);
+    const prompt = buildRelayPrompt(snapshot, text, base);
+    setLastPrompt(prompt);
+    const result = await sendToAiApp(prompt);
+    if (result === 'cancelled') return;
+    resetInput();
+    appendChat({ id: uid('m'), role: 'user', text, relay: { base, snapshot }, at: Date.now() });
+    if (result === 'copied') toast('已複製，請貼到 Claude 或 ChatGPT 送出');
+    if (result === 'failed') toast('無法自動傳送，請按下方「複製內容」');
+  };
+
+  const applyReply = (raw: string) => {
+    const t = getCurrentTrip();
+    if (!t) return;
+    if (looksLikeOwnPrompt(raw)) {
+      toast('剪貼簿裡是要傳給 AI 的內容，請先在 AI App 複製它的回覆');
+      return;
+    }
+    const parsed = parseRelayReply(raw);
+    if (!parsed.message && !parsed.ops) {
+      toast('沒有讀到內容');
+      return;
+    }
+    const current = snapshotOf(t);
+    const currentFp = tripFingerprint(current);
+    const opsFp = parsed.ops?.length ? opsFingerprint(parsed.ops) : undefined;
+    if (opsFp && t.chat.some((m) => m.relayOps === opsFp && m.relayResult === currentFp && !m.undone)) {
+      toast('這則回覆已經套用過了');
+      return;
+    }
+    let start: TripSnapshot = current;
+    const notes: string[] = parsed.problems.map((p) => `⚠️ ${p}`);
+
+    if (parsed.ops?.length && parsed.base) {
+      const sent = [...t.chat].reverse().find((m) => m.relay?.base === parsed.base);
+      if (sent?.relay) {
+        // The AI's operations are relative to the version it was sent; apply them there.
+        const lastApplied = [...t.chat].reverse().find((m) => m.relayBase === parsed.base && m.relayResult);
+        const untouched = currentFp === parsed.base || currentFp === lastApplied?.relayResult;
+        if (
+          !untouched &&
+          !confirm('傳給 AI 之後，行程有其他變動。要以 AI 這次回覆的版本為準嗎？那些變動會被取代（之後可按「復原」）。')
+        ) {
+          return;
+        }
+        start = sent.relay.snapshot;
+      } else {
+        notes.push('⚠️ 找不到這次回覆對應的傳送紀錄，已直接套用到目前的行程');
+      }
+    }
+
+    let result = current;
+    const actions: string[] = [];
+    if (parsed.ops?.length) {
+      const r = applyRelayOps(start, parsed.ops);
+      result = r.trip;
+      actions.push(...r.summary, ...r.errors.map((e) => `⚠️ ${e}`));
+    }
+    actions.push(...notes);
+    const resultFp = tripFingerprint(result);
+    const changed = resultFp !== currentFp;
+    if (changed) replaceSnapshot(result);
+    appendChat({
+      id: uid('m'),
+      role: 'assistant',
+      text: parsed.message || (changed ? '已套用 AI 的修改。' : '（AI 的回覆）'),
+      at: Date.now(),
+      ...(actions.length ? { actions } : {}),
+      ...(changed ? { undo: current, relayResult: resultFp, relayOps: opsFp } : {}),
+      ...(parsed.base ? { relayBase: parsed.base } : {}),
+    });
+    toast(changed ? '已套用 AI 的修改' : parsed.ops ? '這次回覆沒有要變更的內容' : '已加入對話紀錄');
+  };
+
+  const pasteReply = async () => {
+    const text = await readClipboard();
+    if (text) applyReply(text);
+    else setPasteOpen(true);
+  };
+
+  // ---------------------------------------------------------------- shared
+
+  const send = (raw: string) => {
+    const text = raw.trim();
+    if (!text) return;
+    if (direct) void sendDirect(text);
+    else void sendRelay(text);
+  };
+
   const undo = (m: ChatMessage) => {
     if (!m.undo) return;
     if (!confirm('復原這次 AI 的修改？之後手動做的變更也會一起還原。')) return;
     replaceSnapshot(m.undo);
     updateChat(m.id, { undo: undefined, undone: true });
-    useUI.getState().showToast('已復原');
+    toast('已復原');
   };
 
   return (
@@ -143,8 +260,8 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         <div className="chat-title">
           <b>AI 旅遊助理</b>
           <small>
-            {ready ? providerLabel(settings) : '尚未連接 AI'}
-            {ready && settings.chatWebSearch && chatSupportsWebSearch(settings) ? ' · 可搜尋網路' : ''}
+            {providerLabel(settings)}
+            {direct && settings.chatWebSearch && chatSupportsWebSearch(settings) ? ' · 可搜尋網路' : ''}
           </small>
         </div>
         {trip.chat.length > 0 && (
@@ -167,17 +284,24 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
       </div>
 
       <div className="chat-log" ref={log}>
-        {!ready && (
+        {!direct && trip.chat.length === 0 && (
           <div className="notice">
-            連接你自己的 Claude 或 ChatGPT（API 金鑰）後，就能在這裡討論行程，AI 也能直接幫你新增候選、排每天的行程。
-            <div style={{ marginTop: 8 }}>
-              <button className="btn btn-primary btn-sm" onClick={() => useUI.getState().openSettings(true)}>
-                前往設定
-              </button>
-            </div>
+            <b>用你自己的 Claude 或 ChatGPT（訂閱就能用，不需要 API 金鑰）</b>
+            <ol className="steps">
+              <li>在下面輸入需求，按「傳送」，選擇 Claude 或 ChatGPT App。</li>
+              <li>在 AI App 裡按送出，等它回覆。</li>
+              <li>複製 AI 的整則回覆，回到這裡按「📋 貼上回覆」，行程就會自動更新（可一鍵復原）。</li>
+            </ol>
+            <span className="muted small">
+              想讓 AI 直接在這裡修改、不用複製貼上，也可以到{' '}
+              <button className="linklike" onClick={() => useUI.getState().openSettings(true)}>
+                設定
+              </button>{' '}
+              填入 API 金鑰。
+            </span>
           </div>
         )}
-        {ready && trip.chat.length === 0 && !live && (
+        {direct && trip.chat.length === 0 && !live && (
           <div className="notice">
             可以直接說你想怎麼安排，例如「幫我按景點遠近安排各天行程」。AI 修改後，訊息下方會列出改了什麼，也可以一鍵復原。
           </div>
@@ -197,12 +321,34 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         )}
       </div>
 
-      {ready && !props.running && trip.chat.length === 0 && (
+      {!props.running && trip.chat.length === 0 && (
         <div className="suggestions" style={{ padding: '0 10px 6px' }}>
           {SUGGESTIONS.map((s) => (
             <button key={s} className="chip" onClick={() => send(s)}>
               {s}
             </button>
+          ))}
+        </div>
+      )}
+
+      {!direct && (
+        <div className="relay-bar">
+          <button className="btn btn-sm btn-primary" onClick={pasteReply}>
+            📋 貼上回覆
+          </button>
+          {lastPrompt && (
+            <button
+              className="btn btn-sm"
+              onClick={async () => toast((await copyText(lastPrompt)) ? '已複製，請貼到 AI App' : '複製失敗')}
+            >
+              ⧉ 複製內容
+            </button>
+          )}
+          <span className="grow" />
+          {AI_APP_LINKS.map((l) => (
+            <a key={l.label} className="btn btn-sm" href={l.url} target="_blank" rel="noreferrer">
+              {l.label} ↗
+            </a>
           ))}
         </div>
       )}
@@ -215,10 +361,10 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
         }}
       >
         <textarea
+          ref={textarea}
           rows={1}
           value={input}
-          placeholder={ready ? '和 AI 討論行程…' : '請先到設定連接 AI'}
-          disabled={!ready}
+          placeholder={direct ? '和 AI 討論行程…' : '想請 AI 怎麼安排？'}
           onChange={(e) => {
             setInput(e.target.value);
             e.target.style.height = 'auto';
@@ -237,11 +383,21 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
             停止
           </button>
         ) : (
-          <button type="submit" className="btn btn-primary" disabled={!ready || !input.trim()}>
-            送出
+          <button type="submit" className="btn btn-primary" disabled={!input.trim()}>
+            {direct ? '送出' : '傳送'}
           </button>
         )}
       </form>
+
+      {pasteOpen && (
+        <PasteModal
+          title="貼上 AI 的回覆"
+          hint="在 Claude 或 ChatGPT App 裡複製 AI 的整則回覆，貼到下面。"
+          submitLabel="套用"
+          onSubmit={applyReply}
+          onClose={() => setPasteOpen(false)}
+        />
+      )}
     </aside>
   );
 }
@@ -261,7 +417,14 @@ function Sources({ sources }: { sources: SearchSource[] }) {
 }
 
 function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
-  if (m.role === 'user') return <div className="bubble user">{m.text}</div>;
+  if (m.role === 'user') {
+    return (
+      <div className="bubble user">
+        {m.text}
+        {m.relay && <div className="relay-tag">已傳給 AI App</div>}
+      </div>
+    );
+  }
   if (m.role === 'error') return <div className="bubble error">{m.text}</div>;
   return (
     <div className="bubble assistant">
@@ -271,7 +434,7 @@ function Bubble({ m, onUndo }: { m: ChatMessage; onUndo(): void }) {
         <div className="actions-box">
           <ul>
             {m.actions.map((a, i) => (
-              <li key={i}>✓ {a}</li>
+              <li key={i}>{a.startsWith('⚠️') ? a : `✓ ${a}`}</li>
             ))}
           </ul>
           {m.undo ? (

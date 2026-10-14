@@ -74,15 +74,28 @@ function SettingsInner() {
       <div className="section" style={{ marginTop: 0 }}>
         <h3>連接 AI</h3>
         <div className="seg" style={{ marginBottom: 12 }}>
+          <button className={draft.provider === 'relay' ? 'on' : ''} onClick={() => set({ provider: 'relay' })}>
+            用 AI App
+          </button>
           <button className={draft.provider === 'claude' ? 'on' : ''} onClick={() => set({ provider: 'claude' })}>
-            Claude
+            Claude API
           </button>
           <button className={draft.provider === 'openai' ? 'on' : ''} onClick={() => set({ provider: 'openai' })}>
-            ChatGPT / 相容服務
+            ChatGPT API
           </button>
         </div>
 
-        {draft.provider === 'claude' ? (
+        {draft.provider === 'relay' ? (
+          <div className="notice" style={{ marginBottom: 12 }}>
+            <b>免 API 金鑰，用你手機上的 Claude 或 ChatGPT App（訂閱即可）。</b>
+            <ol className="steps">
+              <li>在 AI 討論輸入需求，按「傳送」，選 Claude 或 ChatGPT App。</li>
+              <li>在 AI App 送出，等它回覆。</li>
+              <li>複製整則回覆，回到這裡按「📋 貼上回覆」，行程自動更新。</li>
+            </ol>
+            <span className="muted small">填了 API 金鑰的話，AI 可以直接在這個 App 裡修改，不需要複製貼上（API 另外計費）。</span>
+          </div>
+        ) : draft.provider === 'claude' ? (
           <>
             <label className="field">
               <span>Claude API 金鑰</span>
@@ -179,6 +192,7 @@ function SettingsInner() {
           </>
         )}
 
+        {draft.provider !== 'relay' && (
         <div className="row" style={{ marginBottom: 10 }}>
           <button className="btn btn-sm" onClick={check} disabled={busy}>
             {busy ? '測試中…' : '測試連線'}
@@ -189,6 +203,7 @@ function SettingsInner() {
             </span>
           )}
         </div>
+        )}
         {models && draft.provider === 'claude' && (
           <div className="row-wrap" style={{ marginBottom: 10 }}>
             {models.map((id) => (
@@ -209,13 +224,17 @@ function SettingsInner() {
           </select>
         )}
 
-        <label className="row small" style={{ marginBottom: 6 }}>
-          <input type="checkbox" checked={draft.chatWebSearch} onChange={(e) => set({ chatWebSearch: e.target.checked })} />
-          討論時允許 AI 搜尋網路（Claude；會增加一些費用）
-        </label>
-        <p className="hint">
-          金鑰只存在這台裝置的瀏覽器裡，App 直接連到 AI 服務，不經過其他伺服器。請不要在共用電腦上儲存金鑰。
-        </p>
+        {draft.provider !== 'relay' && (
+          <>
+            <label className="row small" style={{ marginBottom: 6 }}>
+              <input type="checkbox" checked={draft.chatWebSearch} onChange={(e) => set({ chatWebSearch: e.target.checked })} />
+              討論時允許 AI 搜尋網路（Claude；會增加一些費用）
+            </label>
+            <p className="hint">
+              金鑰只存在這台裝置的瀏覽器裡，App 直接連到 AI 服務，不經過其他伺服器。請不要在共用電腦上儲存金鑰。
+            </p>
+          </>
+        )}
       </div>
 
       <details className="more section">

@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
-import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive } from '../lib/ai';
+import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive, spotSearchPrompt } from '../lib/ai';
+import { extractSources, looksLikeOwnPrompt } from '../lib/ai/relay';
+import { readClipboard, sendToAiApp } from '../lib/handoff';
 import { hasCoords, spotRegion } from '../lib/geo';
 import { placeQuery, quickSearchLinks } from '../lib/maps';
 import { CATEGORIES, scheduledDays } from '../lib/tripOps';
@@ -11,6 +13,7 @@ import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { useUI } from '../ui';
 import { Markdown } from './Markdown';
 import { Modal } from './Modal';
+import { PasteModal } from './PasteModal';
 import { SpotMap } from './SpotMap';
 
 export function SpotDetail() {
@@ -149,7 +152,33 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
   const updateSpot = useStore((s) => s.updateSpot);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [pasteOpen, setPasteOpen] = useState(false);
   const ready = aiConfigured(settings);
+  const toast = useUI.getState().showToast;
+
+  // Without an API key: ask the user's own Claude / ChatGPT app, then paste its answer back.
+  const relayAsk = async () => {
+    const r = await sendToAiApp(spotSearchPrompt(spot, trip.destination, true));
+    if (r === 'copied') toast('已複製，請貼到 Claude 或 ChatGPT 送出');
+    if (r === 'failed') toast('無法傳送，請手動複製');
+  };
+  const saveReply = (text: string) => {
+    if (looksLikeOwnPrompt(text)) {
+      toast('剪貼簿裡不是 AI 的回覆');
+      return;
+    }
+    const summary = text.replace(/\r\n?/g, '\n').trim();
+    if (!summary) return;
+    updateSpot(spot.id, {
+      search: { summary, sources: extractSources(summary), provider: 'Claude / ChatGPT App', at: Date.now() },
+    });
+    toast('已存到這個地點');
+  };
+  const relayPaste = async () => {
+    const text = await readClipboard();
+    if (text) saveReply(text);
+    else setPasteOpen(true);
+  };
 
   const runAi = async () => {
     setBusy(true);
@@ -174,17 +203,25 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
             <div className="muted">
               {ready
                 ? `${providerLabel(settings)}${spotSearchIsLive(settings) ? ' · 即時網路搜尋' : ' · 未連網'}`
-                : '到「設定」連接 Claude 或 ChatGPT 後可使用'}
+                : '用你的 Claude / ChatGPT App 查，再把回覆貼回來存檔'}
             </div>
           </div>
-          <button
-            className={`btn btn-sm ${spot.search ? '' : 'btn-primary'}`}
-            disabled={busy || !ready}
-            onClick={runAi}
-          >
-            {busy ? '搜尋中…' : spot.search ? '重新搜尋' : '🔎 搜尋'}
-          </button>
+          {ready && (
+            <button className={`btn btn-sm ${spot.search ? '' : 'btn-primary'}`} disabled={busy} onClick={runAi}>
+              {busy ? '搜尋中…' : spot.search ? '重新搜尋' : '🔎 搜尋'}
+            </button>
+          )}
         </div>
+        {!ready && (
+          <div className="row-wrap" style={{ marginBottom: spot.search ? 8 : 0 }}>
+            <button className="btn btn-sm btn-primary" onClick={relayAsk}>
+              🔎 傳給 AI 查詢
+            </button>
+            <button className="btn btn-sm" onClick={relayPaste}>
+              📋 貼上回覆存檔
+            </button>
+          </div>
+        )}
         {busy && (
           <div className="status-line">
             <span className="spinner" /> 正在搜尋「{placeQuery(spot, trip.destination)}」…
@@ -211,6 +248,16 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
           </>
         )}
       </div>
+
+      {pasteOpen && (
+        <PasteModal
+          title={`貼上「${spot.name}」的查詢結果`}
+          hint="在 Claude 或 ChatGPT App 裡複製 AI 的回覆，貼到下面存檔。"
+          submitLabel="存檔"
+          onSubmit={saveReply}
+          onClose={() => setPasteOpen(false)}
+        />
+      )}
 
       <WikiResults spot={spot} destination={trip.destination} />
 

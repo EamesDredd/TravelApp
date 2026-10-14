@@ -13,11 +13,15 @@ export { FriendlyError };
 /** How many earlier chat messages are sent along with each request. */
 const HISTORY_LIMIT = 30;
 
+/** True when an API key is set, so the app can talk to the AI directly. Otherwise relay mode applies. */
 export function aiConfigured(s: Settings): boolean {
-  return s.provider === 'claude' ? !!s.claudeKey.trim() : !!s.openaiKey.trim() && !!s.openaiBaseUrl.trim();
+  if (s.provider === 'claude') return !!s.claudeKey.trim();
+  if (s.provider === 'openai') return !!s.openaiKey.trim() && !!s.openaiBaseUrl.trim();
+  return false;
 }
 
 export function providerLabel(s: Settings): string {
+  if (!aiConfigured(s)) return '傳到你的 Claude / ChatGPT App（免金鑰）';
   return s.provider === 'claude' ? `Claude · ${s.claudeModel}` : `ChatGPT · ${s.openaiModel}`;
 }
 
@@ -73,7 +77,7 @@ export async function runChatTurn(opts: {
     : openaiChatTurn(s.openaiKey.trim(), s.openaiModel.trim(), s.openaiBaseUrl.trim(), input);
 }
 
-export function spotSearchPrompt(spot: Spot, destination: string): string {
+export function spotSearchPrompt(spot: Spot, destination: string, listSources = false): string {
   const food = spot.category !== 'sight';
   const sections = food
     ? '**簡介**、**營業時間**、**價位**、**招牌菜**、**是否需要訂位**、**交通方式**、**注意事項**'
@@ -83,7 +87,9 @@ export function spotSearchPrompt(spot: Spot, destination: string): string {
   }。
 用繁體中文（台灣用語）整理成以下段落，沒有資料的段落就省略，每段 1–3 行，精簡實用：
 ${sections}
-如果找到的地點可能不是同一個（例如同名分店），請在開頭提醒。不需要在最後另外列出參考網址。`;
+如果找到的地點可能不是同一個（例如同名分店），請在開頭提醒。${
+    listSources ? '請搜尋網路上的最新資訊，並在最後列出參考來源網址。' : '不需要在最後另外列出參考網址。'
+  }`;
 }
 
 export async function searchSpot(settings: Settings, spot: Spot, destination: string): Promise<SpotSearchResult> {

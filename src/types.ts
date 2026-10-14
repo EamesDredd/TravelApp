@@ -68,6 +68,13 @@ export interface ChatMessage {
   undo?: TripSnapshot;
   undone?: boolean;
   sources?: SearchSource[];
+  /** Relay mode, user message: the trip version sent to the AI app. */
+  relay?: { base: string; snapshot: TripSnapshot };
+  /** Relay mode, assistant message: which sent version it answered, and the result's version. */
+  relayBase?: string;
+  relayResult?: string;
+  /** Fingerprint of the applied operations, to spot the same reply pasted twice. */
+  relayOps?: string;
   at: number;
 }
 
@@ -94,7 +101,8 @@ export interface Trip extends TripSnapshot {
   updatedAt: number;
 }
 
-export type AIProvider = 'claude' | 'openai';
+/** relay = send to the user's own Claude / ChatGPT app (no API key). */
+export type AIProvider = 'relay' | 'claude' | 'openai';
 
 export interface Settings {
   provider: AIProvider;
