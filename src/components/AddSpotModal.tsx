@@ -68,7 +68,9 @@ function AddSpotInner() {
 
   const save = () => {
     if (locating) {
-      if (picked) updateSpot(locating.id, { lat: picked.lat, lng: picked.lng, address: address.trim() || picked.address });
+      if (picked) {
+        updateSpot(locating.id, { lat: picked.lat, lng: picked.lng, geo: 'manual', address: address.trim() || picked.address });
+      }
       close();
       ui.showToast('已更新位置');
       return;
@@ -80,7 +82,7 @@ function AddSpotInner() {
       category,
       address: address.trim() || undefined,
       note: note.trim() || undefined,
-      ...(picked ? { lat: picked.lat, lng: picked.lng } : {}),
+      ...(picked ? { lat: picked.lat, lng: picked.lng, geo: 'manual' as const } : {}),
     });
     if (opts.day !== undefined) addToDay(opts.day, id);
     ui.showToast(opts.day !== undefined ? `已加入第 ${opts.day + 1} 天` : '已加入候選');

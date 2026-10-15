@@ -49,6 +49,8 @@ export interface AmapPoi {
   /** GCJ-02 */
   lng: number;
   lat: number;
+  /** e.g. "交通设施服务;地铁站;地铁站" */
+  type?: string;
 }
 
 export function amapPlaceSearch(AMap: AMapNS, keyword: string, city?: string): Promise<AmapPoi[]> {
@@ -68,6 +70,7 @@ export function amapPlaceSearch(AMap: AMapNS, keyword: string, city?: string): P
               .join(' '),
             lng: Number(p.location.lng),
             lat: Number(p.location.lat),
+            ...(typeof p.type === 'string' && p.type ? { type: p.type } : {}),
           })),
       );
     });

@@ -8,9 +8,11 @@ import { RouteModal } from './components/RouteModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SpotDetail } from './components/SpotDetail';
 import { TripForm, TripsModal } from './components/TripsModal';
+import { hasCoords } from './lib/geo';
 import { parseTrip, sharedTripInHash } from './lib/share';
 import { formatDayDate } from './lib/util';
-import { useCurrentTrip, useStore } from './store';
+import { locator } from './locator';
+import { getCurrentTrip, useCurrentTrip, useStore } from './store';
 import { useUI } from './ui';
 
 export default function App() {
@@ -18,6 +20,7 @@ export default function App() {
   const view = useStore((s) => s.view);
   const chatOpen = useStore((s) => s.chatOpen);
   const toast = useUI((s) => s.toast);
+  useAutoLocate();
 
   // Import a trip opened from a share link (#trip=...).
   useEffect(() => {
@@ -57,16 +60,37 @@ export default function App() {
       ) : (
         <Welcome />
       )}
+      {/* The route map opens place details and the locate dialog on top of itself. */}
+      <RouteModal />
       <SpotDetail />
       <AddSpotModal />
       <DayPickerModal />
       <SpotPickerModal />
-      <RouteModal />
       <TripsModal />
       <SettingsModal />
       {toast && <div className="toast">{toast}</div>}
     </>
   );
+}
+
+/** Finds coordinates in the background for places of the open trip that have none. */
+function useAutoLocate() {
+  const trip = useCurrentTrip();
+  const unlocated = trip
+    ? trip.spots
+        .filter((s) => !hasCoords(s))
+        .map((s) => `${s.id}:${s.name}`)
+        .join('|')
+    : '';
+  useEffect(() => {
+    const t = getCurrentTrip();
+    if (t && unlocated) locator.schedule(t);
+  }, [trip?.id, unlocated]);
+  useEffect(() => {
+    const resume = () => locator.resume();
+    window.addEventListener('online', resume);
+    return () => window.removeEventListener('online', resume);
+  }, []);
 }
 
 function Welcome() {

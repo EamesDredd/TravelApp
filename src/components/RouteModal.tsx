@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { amapCityCode, loadAmap, type AMapNS } from '../lib/amap';
+import { locateKey, useLocateStatus } from '../lib/autoLocate';
 import { distanceKm, estimateMinutes, formatKm, formatMinutes, hasCoords, stopsRegion, wgsToGcj } from '../lib/geo';
 import {
   amapNavigationUrl,
+  amapSearchUrl,
   chunkStops,
   googleDirectionsUrl,
   googleEmbedDirectionsUrl,
   tripToKml,
 } from '../lib/maps';
 import { downloadFile, formatDayDate, safeFilename } from '../lib/util';
-import { useCurrentTrip, useStore } from '../store';
+import { locator } from '../locator';
+import { getCurrentTrip, useCurrentTrip, useStore } from '../store';
 import type { Spot, TravelMode } from '../types';
 import { CATEGORY_ICON } from '../types';
 import { useUI } from '../ui';
@@ -75,9 +78,21 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
   // walking takes no waypoints either, so those are shown one leg at a time.
   const perLeg = legs.length > 0 && (mode === 'transit' || (mode === 'walking' && region === 'cn'));
   const missing = stops.filter((s) => !hasCoords(s));
+  const statuses = useLocateStatus((s) => s.byKey);
+  const busy = (s: Spot) => ['queued', 'locating'].includes(statuses[locateKey(trip.id, s)] ?? '');
+  const locating = missing.filter(busy);
+  const unfound = missing.filter((s) => !busy(s));
+  const guessed = stops.filter((s) => hasCoords(s) && s.geo === 'auto');
+  const ui = useUI();
   const amapReady = region === 'cn' && !!settings.amapKey.trim();
   const close = () => useUI.getState().openRoute(null);
   const date = formatDayDate(trip.startDate, dayIdx);
+
+  // Look up places without coordinates as soon as the route is opened.
+  useEffect(() => {
+    const t = getCurrentTrip();
+    if (t) locator.schedule(t);
+  }, []);
 
   const exportKml = () => {
     const kml = tripToKml(trip, [dayIdx], (i) => `第${i + 1}天 ${formatDayDate(trip.startDate, i)}`.trim());
@@ -119,8 +134,39 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
           地圖上是直線連線。要在 App 內看實際路線與即時路況，請在設定填入高德 Key；或用下方按鈕直接開啟高德地圖導航。
         </p>
       )}
-      {missing.length > 0 && (
-        <p className="hint">⚠️ 尚未定位：{missing.map((s) => s.name).join('、')}（到地點詳情按「定位」）。</p>
+      {locating.length > 0 && (
+        <p className="hint">
+          <span className="spinner" /> 正在自動定位：{locating.map((s) => s.name).join('、')}…
+        </p>
+      )}
+      {unfound.length > 0 && (
+        <div className="notice" style={{ marginTop: 8 }}>
+          ⚠️ 找不到位置，路線少了這些地點：{unfound.map((s) => s.name).join('、')}
+          <div className="row-wrap" style={{ marginTop: 8 }}>
+            {unfound.map((s) => (
+              <button key={s.id} className="btn btn-sm" onClick={() => ui.openAddSpot({ locateId: s.id })}>
+                📍 定位「{s.name}」
+              </button>
+            ))}
+            <button className="btn btn-sm" onClick={() => locator.retry(trip, unfound.map((s) => s.id))}>
+              ↻ 重新搜尋
+            </button>
+          </div>
+        </div>
+      )}
+      {guessed.length > 0 && (
+        <p className="hint">
+          ℹ️ 自動定位：
+          {guessed.map((s, i) => (
+            <span key={s.id}>
+              {i > 0 && '、'}
+              <button className="linklike" onClick={() => ui.openSpot(s.id)}>
+                {s.name}
+              </button>
+            </span>
+          ))}
+          。位置不對的話，點名稱後按「修正位置」。
+        </p>
       )}
 
       <div className="section">
@@ -131,8 +177,12 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
         <ol className="legs">
           {legs.map(({ a, b, i }) => {
             const km = hasCoords(a) && hasCoords(b) ? distanceKm(a, b) : null;
+            const located = region !== 'cn' || km !== null;
+            // Amap needs coordinates for a route; without them, at least find the next place.
             const nav =
-              region === 'cn' ? amapNavigationUrl(a, b, mode) : googleDirectionsUrl([a, b], mode, trip.destination);
+              region === 'cn'
+                ? (amapNavigationUrl(a, b, mode) ?? amapSearchUrl(b, trip.destination))
+                : googleDirectionsUrl([a, b], mode, trip.destination);
             return (
               <li
                 key={`${a.id}-${b.id}-${i}`}
@@ -145,7 +195,11 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
                     {CATEGORY_ICON[a.category]} {a.name} → {CATEGORY_ICON[b.category]} {b.name}
                   </b>
                   <div className="muted">
-                    {km !== null ? `${formatKm(km)} · 約 ${formatMinutes(estimateMinutes(km, mode))}` : '缺少座標'}
+                    {km !== null
+                      ? `${formatKm(km)} · 約 ${formatMinutes(estimateMinutes(km, mode))}`
+                      : busy(a) || busy(b)
+                        ? '定位中…'
+                        : '缺少座標'}
                   </div>
                 </span>
                 {nav ? (
@@ -156,7 +210,7 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
                     rel="noreferrer"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    導航
+                    {located ? '導航' : '搜尋'}
                   </a>
                 ) : null}
               </li>

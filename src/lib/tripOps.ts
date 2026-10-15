@@ -1,4 +1,5 @@
 import type { Category, Day, PlanItem, Spot, Trip, TripSnapshot } from '../types';
+import { hasCoords } from './geo';
 import { uid } from './util';
 
 export const CATEGORIES: Category[] = ['sight', 'breakfast', 'meal'];
@@ -77,4 +78,36 @@ export function removeSpotEverywhere<T extends TripSnapshot>(trip: T, spotId: st
     spots: trip.spots.filter((s) => s.id !== spotId),
     days: trip.days.map((d) => ({ ...d, items: d.items.filter((it) => it.spotId !== spotId) })),
   };
+}
+
+/** Same place name, ignoring spaces and case. */
+export const nameKey = (n: string) => n.replace(/\s+/g, '').toLowerCase();
+
+/**
+ * Locations are facts about places, not plan decisions. When `target` (a snapshot being
+ * restored or applied) has no coordinates for a place the current trip has already located,
+ * keep them. With `keepManual` (restoring or re-applying an older version), a location the
+ * user picked by hand also wins over the older coordinates. Matches by id (same name), or by
+ * name for places `target` re-created under a new id.
+ */
+export function keepLocations<T extends TripSnapshot>(target: T, current: TripSnapshot, keepManual = false): T {
+  const byId = new Map(current.spots.map((s) => [s.id, s]));
+  const targetIds = new Set(target.spots.map((s) => s.id));
+  const byName = new Map(
+    current.spots.filter((s) => hasCoords(s) && !targetIds.has(s.id)).map((s) => [nameKey(s.name), s]),
+  );
+  let changed = false;
+  const spots = target.spots.map((s) => {
+    const same = byId.get(s.id);
+    const cur = same ? (nameKey(same.name) === nameKey(s.name) ? same : undefined) : byName.get(nameKey(s.name));
+    if (!cur || !hasCoords(cur)) return s;
+    if (hasCoords(s) && !(keepManual && cur.geo === 'manual')) return s;
+    if (s.lat === cur.lat && s.lng === cur.lng && s.geo === cur.geo) return s;
+    changed = true;
+    const next: Spot = { ...s, lat: cur.lat, lng: cur.lng };
+    if (cur.geo) next.geo = cur.geo;
+    else delete next.geo;
+    return next;
+  });
+  return changed ? { ...target, spots } : target;
 }

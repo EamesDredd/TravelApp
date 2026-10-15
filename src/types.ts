@@ -33,6 +33,8 @@ export interface Spot {
   /** WGS-84 coordinates. Converted to GCJ-02 only when talking to Amap. */
   lat?: number;
   lng?: number;
+  /** How the coordinates were found: auto = searched by the app (may be off), manual = picked by the user. */
+  geo?: 'auto' | 'manual';
   note?: string;
   /** Suggested visit length in minutes. */
   durationMin?: number;

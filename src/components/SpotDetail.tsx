@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive, spotSearchPrompt } from '../lib/ai';
 import { buildRelaySearchPrompt, extractSources, looksLikeOwnPrompt, parseRelayReply } from '../lib/ai/relay';
+import { locateKey, useLocateStatus } from '../lib/autoLocate';
 import { copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { hasCoords, spotRegion } from '../lib/geo';
 import { placeQuery, quickSearchLinks } from '../lib/maps';
@@ -31,6 +32,7 @@ function SpotDetailInner({ trip, spot, onClose }: { trip: Trip; spot: Spot; onCl
   const ui = useUI();
   const region = spotRegion(spot, trip);
   const days = scheduledDays(trip, spot.id);
+  const locateStatus = useLocateStatus((s) => s.byKey[locateKey(trip.id, spot)]);
 
   return (
     <Modal
@@ -108,7 +110,13 @@ function SpotDetailInner({ trip, spot, onClose }: { trip: Trip; spot: Spot; onCl
         </label>
         <div className="row" style={{ marginBottom: 12 }}>
           <span className="small muted grow">
-            {hasCoords(spot) ? `座標 ${spot.lat.toFixed(5)}, ${spot.lng.toFixed(5)}` : '尚未定位（距離與路線估算需要座標）'}
+            {hasCoords(spot)
+              ? `座標 ${spot.lat.toFixed(5)}, ${spot.lng.toFixed(5)}${spot.geo === 'auto' ? '（自動定位，可能不準）' : ''}`
+              : locateStatus === 'queued' || locateStatus === 'locating'
+                ? '自動定位中…'
+                : locateStatus === 'not-found'
+                  ? '自動定位找不到這個地點，請按「定位」搜尋'
+                  : '尚未定位（距離與路線估算需要座標）'}
           </span>
           <button className="btn btn-sm" onClick={() => ui.openAddSpot({ locateId: spot.id })}>
             📍 {hasCoords(spot) ? '修正位置' : '定位'}
