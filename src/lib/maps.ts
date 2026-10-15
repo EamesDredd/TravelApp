@@ -1,4 +1,4 @@
-import type { Day, Spot, TravelMode, Trip } from '../types';
+import type { Day, LatLng, Spot, TravelMode, Trip } from '../types';
 import { CATEGORY_LABEL } from '../types';
 import { hasCoords, wgsToGcj } from './geo';
 
@@ -136,6 +136,99 @@ export function amapNavigationUrl(from: Spot | null, to: Spot, mode: TravelMode,
   return `https://uri.amap.com/navigation?${params.toString()}`;
 }
 
+// ---------------------------------------------------------------- opening the apps
+
+/**
+ * A map link that can open the Google Maps or Amap app instead of the web page.
+ * `web` is for the browser (and desktop); `ios` is the app's URL scheme on iPhone; `android`
+ * is a Chrome intent that opens the app, or `web` when the app is not installed.
+ */
+export interface AppLink {
+  app: 'google' | 'amap';
+  web: string;
+  ios?: string;
+  android?: string;
+}
+
+const GOOGLE_PACKAGE = 'com.google.android.apps.maps';
+const AMAP_PACKAGE = 'com.autonavi.minimap';
+
+/** Chrome intent for `native` (scheme://rest) in `pkg`, with `fallback` when the app is missing. */
+export function intentUrl(native: string, pkg: string, fallback: string): string {
+  const m = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/i.exec(native);
+  if (!m) return fallback;
+  return `intent://${m[2]}#Intent;scheme=${m[1]};package=${pkg};S.browser_fallback_url=${enc(fallback)};end`;
+}
+
+function googleApp(web: string, ios: string): AppLink {
+  return { app: 'google', web, ios, android: intentUrl(web, GOOGLE_PACKAGE, web) };
+}
+
+export function googleSearchLink(spot: Spot, destination?: string): AppLink {
+  return googleApp(googleSearchUrl(spot, destination), `comgooglemaps://?q=${enc(placeQuery(spot, destination))}`);
+}
+
+/** Directions in the app; like the web link, transit goes straight from the first stop to the last. */
+export function googleDirectionsLink(stops: Spot[], mode: TravelMode, destination?: string): AppLink {
+  const q = stops.map((s) => placeQuery(s, destination));
+  const params = [`directionsmode=${GOOGLE_MODE[mode]}`];
+  if (q.length === 1) {
+    params.unshift(`daddr=${enc(q[0])}`);
+  } else {
+    const via = mode === 'transit' ? [] : q.slice(1, -1);
+    params.unshift(`saddr=${enc(q[0])}`, `daddr=${[...via, q[q.length - 1]].map(enc).join('+to:')}`);
+  }
+  return googleApp(googleDirectionsUrl(stops, mode, destination), `comgooglemaps://?${params.join('&')}`);
+}
+
+function amapApp(web: string, ios: string, android: string): AppLink {
+  return { app: 'amap', web, ios, android: intentUrl(android, AMAP_PACKAGE, web) };
+}
+
+const AMAP_APP_MODE: Record<TravelMode, string> = { driving: '0', transit: '1', walking: '2' };
+
+/** Search by name in the Amap app. */
+export function amapSearchLink(spot: Spot, destination?: string): AppLink {
+  const ios = new URLSearchParams({ sourceApplication: SRC, name: spot.name, dev: '0' });
+  const android = new URLSearchParams({ sourceApplication: SRC, keywords: spot.name, dev: '0' });
+  return amapApp(amapSearchUrl(spot, destination), `iosamap://poi?${ios}`, `androidamap://poi?${android}`);
+}
+
+/** The place on the Amap app's map, or a search when it has no coordinates. */
+export function amapPlaceLink(spot: Spot, destination?: string): AppLink {
+  if (!hasCoords(spot)) return amapSearchLink(spot, destination);
+  const g = wgsToGcj(spot);
+  const params = new URLSearchParams({
+    sourceApplication: SRC,
+    poiname: spot.name,
+    lat: g.lat.toFixed(6),
+    lon: g.lng.toFixed(6),
+    dev: '0', // already GCJ-02
+  });
+  return amapApp(amapPlaceUrl(spot, destination), `iosamap://viewMap?${params}`, `androidamap://viewMap?${params}`);
+}
+
+/** Route in the Amap app; null without coordinates. A stop on the way is left to the web page. */
+export function amapNavigationLink(from: Spot, to: Spot, mode: TravelMode, via?: Spot): AppLink | null {
+  const web = amapNavigationUrl(from, to, mode, via);
+  if (!web) return null;
+  if (via && hasCoords(via) && mode === 'driving') return { app: 'amap', web };
+  const a = wgsToGcj(from as LatLng);
+  const b = wgsToGcj(to as LatLng);
+  const params = new URLSearchParams({
+    sourceApplication: SRC,
+    slat: a.lat.toFixed(6),
+    slon: a.lng.toFixed(6),
+    sname: from.name,
+    dlat: b.lat.toFixed(6),
+    dlon: b.lng.toFixed(6),
+    dname: to.name,
+    dev: '0',
+    t: AMAP_APP_MODE[mode],
+  });
+  return amapApp(web, `iosamap://path?${params}`, `amapuri://route/plan/?${params}`);
+}
+
 // ---------------------------------------------------------------- KML (Google 我的地圖)
 
 function xml(s: string): string {
@@ -185,6 +278,8 @@ export function tripToKml(trip: Trip, dayIndexes?: number[], dayLabel?: (i: numb
 export interface QuickLink {
   label: string;
   url: string;
+  /** Opens the map app when there is one. */
+  app?: AppLink;
 }
 
 export function quickSearchLinks(spot: Spot, destination: string | undefined, region: 'cn' | 'intl'): QuickLink[] {
@@ -193,11 +288,11 @@ export function quickSearchLinks(spot: Spot, destination: string | undefined, re
   if (region === 'cn') {
     links.push({ label: '百度', url: `https://www.baidu.com/s?wd=${enc(q)}` });
     links.push({ label: '小紅書', url: `https://www.xiaohongshu.com/search_result?keyword=${enc(q)}` });
-    links.push({ label: '高德', url: amapPlaceUrl(spot, destination) });
+    links.push({ label: '高德', url: amapPlaceUrl(spot, destination), app: amapPlaceLink(spot, destination) });
     links.push({ label: 'Google', url: `https://www.google.com/search?q=${enc(q)}` });
   } else {
     links.push({ label: 'Google', url: `https://www.google.com/search?q=${enc(q)}` });
-    links.push({ label: 'Google 地圖評論', url: googleSearchUrl(spot, destination) });
+    links.push({ label: 'Google 地圖評論', url: googleSearchUrl(spot, destination), app: googleSearchLink(spot, destination) });
     links.push({ label: '小紅書', url: `https://www.xiaohongshu.com/search_result?keyword=${enc(q)}` });
     links.push({ label: 'TripAdvisor', url: `https://www.tripadvisor.com.tw/Search?q=${enc(q)}` });
   }

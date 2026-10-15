@@ -4,10 +4,10 @@ import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
 import { useOnline } from '../lib/online';
 import { distanceKm, estimateMinutes, formatKm, formatMinutes, hasCoords, stopsRegion, wgsToGcj } from '../lib/geo';
 import {
-  amapNavigationUrl,
-  amapSearchUrl,
+  amapNavigationLink,
+  amapSearchLink,
   chunkStops,
-  googleDirectionsUrl,
+  googleDirectionsLink,
   googleEmbedDirectionsUrl,
   tripToKml,
 } from '../lib/maps';
@@ -18,6 +18,7 @@ import type { Spot, TravelMode } from '../types';
 import { CATEGORY_ICON } from '../types';
 import { useUI } from '../ui';
 import { LeafletMap, type MapPoint } from './LeafletMap';
+import { MapAppLink } from './MapAppLink';
 import { Modal } from './Modal';
 
 const MODES: { id: TravelMode; label: string }[] = [
@@ -201,8 +202,8 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
             // Amap needs coordinates for a route; without them, at least find the next place.
             const nav =
               region === 'cn'
-                ? (amapNavigationUrl(a, b, mode) ?? amapSearchUrl(b, trip.destination))
-                : googleDirectionsUrl([a, b], mode, trip.destination);
+                ? (amapNavigationLink(a, b, mode) ?? amapSearchLink(b, trip.destination))
+                : googleDirectionsLink([a, b], mode, trip.destination);
             return (
               <li
                 key={`${a.id}-${b.id}-${i}`}
@@ -222,17 +223,9 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
                         : '缺少座標'}
                   </div>
                 </span>
-                {nav ? (
-                  <a
-                    className="btn btn-sm"
-                    href={nav}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {located ? '導航' : '搜尋'}
-                  </a>
-                ) : null}
+                <MapAppLink className="btn btn-sm" link={nav} onClick={(e) => e.stopPropagation()}>
+                  {located ? '導航' : '搜尋'}
+                </MapAppLink>
               </li>
             );
           })}
@@ -248,15 +241,9 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
               <span className="hint">Google 地圖的大眾運輸不支援多個中途點，請用上方各段的「導航」。</span>
             ) : (
               chunkStops(stops).map((chunk, i, all) => (
-                <a
-                  key={i}
-                  className="btn btn-primary"
-                  href={googleDirectionsUrl(chunk, mode, trip.destination)}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <MapAppLink key={i} className="btn btn-primary" link={googleDirectionsLink(chunk, mode, trip.destination)}>
                   Google 地圖{all.length > 1 ? ` (${i + 1}/${all.length})` : ''}：{chunk[0].name} → {chunk[chunk.length - 1].name}
-                </a>
+                </MapAppLink>
               ))
             )
           ) : mode === 'driving' && stops.length >= 2 && stops.length <= 3 ? (
@@ -286,12 +273,12 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
 }
 
 function AmapLink({ stops }: { stops: Spot[] }) {
-  const url = amapNavigationUrl(stops[0], stops[stops.length - 1], 'driving', stops.length === 3 ? stops[1] : undefined);
-  if (!url) return <span className="hint">需要先定位所有地點。</span>;
+  const link = amapNavigationLink(stops[0], stops[stops.length - 1], 'driving', stops.length === 3 ? stops[1] : undefined);
+  if (!link) return <span className="hint">需要先定位所有地點。</span>;
   return (
-    <a className="btn btn-primary" href={url} target="_blank" rel="noreferrer">
+    <MapAppLink className="btn btn-primary" link={link}>
       在高德地圖開啟整天路線
-    </a>
+    </MapAppLink>
   );
 }
 

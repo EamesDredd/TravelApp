@@ -127,4 +127,6 @@ export interface Settings {
   googleMapsKey: string;
   amapKey: string;
   amapSecurityCode: string;
+  /** Open Google Maps / Amap links in the phone's app when it has one. */
+  preferMapApps: boolean;
 }

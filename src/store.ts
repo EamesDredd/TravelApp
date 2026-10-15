@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS: Settings = {
   googleMapsKey: '',
   amapKey: '',
   amapSecurityCode: '',
+  preferMapApps: true,
 };
 
 /** Keep undo snapshots only on the most recent assistant turns so storage stays small. */

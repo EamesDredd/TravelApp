@@ -13,6 +13,7 @@ import { useCurrentTrip, useStore } from '../store';
 import type { Category, Spot, Trip } from '../types';
 import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { useUI } from '../ui';
+import { MapAppLink } from './MapAppLink';
 import { Markdown } from './Markdown';
 import { Modal } from './Modal';
 import { PasteModal } from './PasteModal';
@@ -302,11 +303,17 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
       <WikiResults spot={spot} destination={trip.destination} />
 
       <div className="row-wrap" style={{ marginTop: 10 }}>
-        {quickSearchLinks(spot, trip.destination, region).map((l) => (
-          <a key={l.label} className="chip" href={l.url} target="_blank" rel="noreferrer">
-            {l.label} ↗
-          </a>
-        ))}
+        {quickSearchLinks(spot, trip.destination, region).map((l) =>
+          l.app ? (
+            <MapAppLink key={l.label} className="chip" link={l.app}>
+              {l.label} ↗
+            </MapAppLink>
+          ) : (
+            <a key={l.label} className="chip" href={l.url} target="_blank" rel="noreferrer">
+              {l.label} ↗
+            </a>
+          ),
+        )}
       </div>
     </div>
   );
