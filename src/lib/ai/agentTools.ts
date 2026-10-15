@@ -3,7 +3,8 @@
 import type { Category, Day, PlanItem, Spot, TripSnapshot } from '../../types';
 import { CATEGORY_LABEL } from '../../types';
 import { hasCoords, isMainlandChina } from '../geo';
-import { isCategory, makeItem, makeSpot, resizeDays, scheduledDays } from '../tripOps';
+import { normName } from '../placeMatch';
+import { isCategory, makeItem, makeSpot, resizeDays, scheduledDays, withRelocation } from '../tripOps';
 import { formatDayDate, normalizeTime, parseDate, toIsoDate, weekdayName } from '../util';
 
 export interface ToolDef {
@@ -137,7 +138,8 @@ export const WEB_SEARCH_NOTE = '\n- 需要最新資訊（營業時間、票價�
 // ------------------------------------------------------------------ state text
 
 function fmtCoord(s: Spot): string {
-  return hasCoords(s) ? `${s.lat!.toFixed(5)},${s.lng!.toFixed(5)}` : '（無座標）';
+  if (!hasCoords(s)) return '（無座標）';
+  return `${s.lat!.toFixed(5)},${s.lng!.toFixed(5)}${s.geo === 'auto' ? '（App 依名稱自動定位，可能不準）' : ''}`;
 }
 
 export function describeDay(trip: TripSnapshot, i: number): string {
@@ -419,7 +421,10 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
     if (lat !== undefined && lng !== undefined) {
       patch.lat = lat;
       patch.lng = lng;
-      patch.geo = undefined; // given by the AI, no longer the app's own guess
+      // Given by the AI, no longer the app's own guess, unless it only repeats the coordinates
+      // it was shown.
+      const same = hasCoords(spot) && Math.abs(spot.lat - lat) < 1e-4 && Math.abs(spot.lng - lng) < 1e-4;
+      if (!same) patch.geo = undefined;
     } else if (lat !== undefined || lng !== undefined) {
       errors.push(`${id} 的座標要同時提供 lat 和 lng`);
     }
@@ -429,7 +434,8 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
       errors.push(`${id} 沒有可以更新的欄位`);
       continue;
     }
-    next = { ...next, spots: next.spots.map((s) => (s.id === id ? { ...s, ...patch } : s)) };
+    const applied = withRelocation(spot, patch, (a, b) => normName(a) === normName(b));
+    next = { ...next, spots: next.spots.map((s) => (s.id === id ? { ...s, ...applied } : s)) };
     edited++;
     done.push(`已更新 ${id} ${patch.name ?? spot.name}`);
   }

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { locateKey, useLocateStatus } from '../lib/autoLocate';
 import { hasCoords } from '../lib/geo';
+import { useOnline } from '../lib/online';
 import { CATEGORIES, scheduledDays } from '../lib/tripOps';
 import { useCurrentTrip } from '../store';
 import type { Category } from '../types';
@@ -14,8 +15,9 @@ export function CandidatePool() {
   const [onlyFree, setOnlyFree] = useState(false);
   const [q, setQ] = useState('');
   const statuses = useLocateStatus((s) => s.byKey);
+  const online = useOnline();
   const locating = (id: string, name: string) =>
-    ['queued', 'locating'].includes(statuses[locateKey(trip.id, { id, name })] ?? '');
+    online && ['queued', 'locating'].includes(statuses[locateKey(trip.id, { id, name })] ?? '');
 
   const count = (c: Category) => trip.spots.filter((s) => s.category === c).length;
   const list = trip.spots

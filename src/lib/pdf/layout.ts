@@ -35,9 +35,12 @@ export interface LayoutOptions {
 // ------------------------------------------------------------------ text
 
 const CJK = '\\u2e80-\\u9fff\\uf900-\\ufaff\\uff00-\\uffef\\u3000-\\u303f\\uac00-\\ud7af';
-const TOKEN = new RegExp(`\\s+|[^\\s${CJK}]+|.`, 'gsu');
 // Never start a line with these (they stay with the text before them).
-const NO_START = /^[，。、；：！？）」』》〉】,.;:!?)\]}%…・ー〜~]/;
+const NO_START_CHARS = '，。、；：！？）」』》〉】,.;:!?)\\]}%…・ー〜~';
+const NO_START = new RegExp(`^[${NO_START_CHARS}]`);
+// Spaces, a no-start mark on its own (so "官網:https://…" can still wrap the URL), a run of
+// non-CJK text (a word), or one character.
+const TOKEN = new RegExp(`\\s+|[${NO_START_CHARS}]|[^\\s${CJK}]+|.`, 'gsu');
 
 /** Breaks text into lines no wider than `maxW`: between CJK characters, or between words. */
 export function wrapText(text: string, maxW: number, size: number, weight: number, measure: Measure): string[] {
@@ -131,16 +134,15 @@ const TIME_X = PAGE.left + 25;
 const BODY_X = PAGE.left + 70;
 const BODY_W = PAGE.left + CW - BODY_X;
 
-function itemBlock(item: ItemModel, measure: Measure): Block {
+/** A stop: its heading (badge, time, name, details), then one block per note line, so very long notes flow onto the next page. */
+function itemBlocks(item: ItemModel, measure: Measure): Block[] {
   const nameLines = wrapText(`${item.icon} ${item.name}`, BODY_W, 12, 700, measure);
   const metaLines = item.meta ? wrapText(item.meta, BODY_W, 9, 400, measure) : [];
   const noteLines = item.notes.flatMap((n) => wrapText(n, BODY_W, 9, 400, measure));
   const name = textBlock(nameLines, BODY_X, 12, 700, COLORS.text, measure, { lineHeight: 16, url: item.url });
   const meta = textBlock(metaLines, BODY_X, 9, 400, COLORS.muted, measure, { lineHeight: 13 });
-  const notes = textBlock(noteLines, BODY_X, 9, 400, COLORS.body, measure, { lineHeight: 13 });
-  const h = Math.max(20, name.h + meta.h + (noteLines.length ? notes.h + 2 : 0)) + 4;
-  return {
-    h,
+  const head: Block = {
+    h: Math.max(20, name.h + meta.h) + (noteLines.length ? 2 : 4),
     draw: (y) => {
       const label = String(item.no);
       const ops: Op[] = [
@@ -157,10 +159,13 @@ function itemBlock(item: ItemModel, measure: Measure): Block {
       ];
       if (item.time) ops.push({ t: 'text', x: TIME_X, y: y + 13, text: item.time, size: 11, weight: 700, color: COLORS.text });
       ops.push(...name.draw(y), ...meta.draw(y + name.h));
-      if (noteLines.length) ops.push(...notes.draw(y + name.h + meta.h + 2));
       return ops;
     },
   };
+  const notes = noteLines.map((line, i) =>
+    textBlock([line], BODY_X, 9, 400, COLORS.body, measure, { lineHeight: 13, after: i === noteLines.length - 1 ? 4 : 0 }),
+  );
+  return [head, ...notes];
 }
 
 function legBlock(item: ItemModel, measure: Measure): Block {
@@ -214,8 +219,8 @@ function dayGroups(day: DayModel, measure: Measure, opts: LayoutOptions): Group[
     return [{ blocks: head, keep: true, newPage: opts.newPagePerDay }];
   }
   // The day's heading stays with its first stop.
-  const groups: Group[] = [{ blocks: [...head, gap(4), itemBlock(day.items[0], measure)], keep: true, newPage: opts.newPagePerDay }];
-  for (const item of day.items.slice(1)) groups.push({ blocks: [legBlock(item, measure), itemBlock(item, measure)], keep: true });
+  const groups: Group[] = [{ blocks: [...head, gap(4), ...itemBlocks(day.items[0], measure)], keep: true, newPage: opts.newPagePerDay }];
+  for (const item of day.items.slice(1)) groups.push({ blocks: [legBlock(item, measure), ...itemBlocks(item, measure)], keep: true });
   return groups;
 }
 

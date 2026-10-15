@@ -118,7 +118,8 @@ export function buildItinerary(trip: Trip, opts: PdfOptions, now = new Date()): 
       .map(({ s }, n) => ({ s, n }))
       .filter(({ s }) => hasCoords(s))
       .map(({ s, n }) => ({ lat: s.lat!, lng: s.lng!, label: String(n + 1), color: PIN_COLORS[s.category] }));
-    const unlocated = [...new Set(entries.filter(({ s }) => !hasCoords(s)).map(({ s }) => s.name))];
+    // Only worth saying when the PDF has maps.
+    const unlocated = opts.maps ? [...new Set(entries.filter(({ s }) => !hasCoords(s)).map(({ s }) => s.name))] : [];
     return {
       heading: `第 ${i + 1} 天`,
       date: formatDayDate(trip.startDate, i),

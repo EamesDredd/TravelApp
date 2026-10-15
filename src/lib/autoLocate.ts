@@ -3,14 +3,15 @@
 import { create } from 'zustand';
 import { hasCoords, tripRegion, type ResolvedRegion } from './geo';
 import { searchAmap, searchOsm, type PlaceResult } from './geocode';
-import { centroid, isGenericName, normName, pickPlace, queryVariants } from './placeMatch';
+import { centroid, isGenericName, normName, pickPlaceDetailed, queryVariants } from './placeMatch';
 import type { LatLng, Settings, Spot, Trip } from '../types';
 
 /**
  * queued / locating: waiting or searching; found: located automatically this session;
- * not-found: no confident match (locate by hand); skipped: not a place ("午餐（附近找）").
+ * not-found: no confident match (locate by hand); skipped: not a place ("午餐（附近找）");
+ * no-area: the trip has no destination or located place yet to tell where to search.
  */
-export type LocateStatus = 'queued' | 'locating' | 'found' | 'not-found' | 'skipped';
+export type LocateStatus = 'queued' | 'locating' | 'found' | 'not-found' | 'skipped' | 'no-area';
 
 export const useLocateStatus = create<{ byKey: Record<string, LocateStatus> }>(() => ({ byKey: {} }));
 
@@ -36,17 +37,33 @@ export interface Searchers {
   amap: typeof searchAmap;
 }
 
+export interface FindResult {
+  place: PlaceResult | null;
+  /** Nothing matched only because the matches were too far from the trip (try again later). */
+  far: boolean;
+}
+
+/** An exact name match may be this far away: the trip's second city (Tokyo and Osaka). */
+const EXACT_KM = 1000;
+
 /**
- * Finds the place a spot names, or null when nothing matches confidently.
+ * Finds the place a spot names; `place` is null when nothing matches confidently.
  * Throws when OpenStreetMap cannot be reached (so the caller can try again later).
  */
 export async function findPlace(
-  name: string,
+  spot: { name: string; address?: string },
   ctx: FindContext,
   s: Searchers = { osm: searchOsm, amap: searchAmap },
-): Promise<PlaceResult | null> {
+): Promise<FindResult> {
+  const name = spot.name;
   const variants = queryVariants(name);
-  if (!variants.length) return null;
+  let far = false;
+  const pick = (results: PlaceResult[], q: string, exactKm?: number) => {
+    const p = pickPlaceDetailed(results, name, q, ctx.anchors, { address: spot.address, exactKm });
+    far ||= p.far;
+    return p.place;
+  };
+  if (!variants.length) return { place: null, far };
   if (ctx.amap && ctx.region === 'cn') {
     for (const q of variants.slice(0, 2)) {
       let results: PlaceResult[];
@@ -55,20 +72,20 @@ export async function findPlace(
       } catch {
         break; // key not working here: OpenStreetMap below
       }
-      const hit = pickPlace(results, name, q, ctx.anchors);
-      if (hit) return hit;
+      const hit = pick(results, q);
+      if (hit) return { place: hit, far: false };
     }
   }
   for (const q of variants) {
-    const hit = pickPlace(await s.osm(q, { near: ctx.center, bounded: !!ctx.center }), name, q, ctx.anchors);
-    if (hit) return hit;
+    const hit = pick(await s.osm(q, { near: ctx.center, bounded: !!ctx.center }), q);
+    if (hit) return { place: hit, far: false };
   }
   if (ctx.center) {
-    // Outside the box around the trip (a day trip further out); still near some place of the trip.
-    const hit = pickPlace(await s.osm(variants[0], {}), name, variants[0], ctx.anchors);
-    if (hit) return hit;
+    // Outside the box around the trip: a day trip further out, or the trip's second city.
+    const hit = pick(await s.osm(variants[0], {}), variants[0], EXACT_KM);
+    if (hit) return { place: hit, far: false };
   }
-  return null;
+  return { place: null, far };
 }
 
 export function contextFor(trip: Trip, settings: Pick<Settings, 'amapKey' | 'amapSecurityCode'>): FindContext {
@@ -132,10 +149,10 @@ export function localMissMemory(): MissMemory {
 export interface LocatorDeps {
   getTrip(id: string): Trip | undefined;
   getSettings(): Pick<Settings, 'amapKey' | 'amapSecurityCode'>;
-  find(name: string, ctx: FindContext): Promise<PlaceResult | null>;
+  find(spot: { name: string; address?: string }, ctx: FindContext): Promise<FindResult>;
   /** Stores the location if the spot still has the same name and no coordinates; false otherwise. */
   save(tripId: string, spotId: string, name: string, place: LatLng): boolean;
-  /** Centre of the destination, for trips without any located place yet. */
+  /** Centre of the destination, for trips without any located place yet (throws when offline). */
   findCenter(destination: string): Promise<LatLng | null>;
   setCenter(tripId: string, center: LatLng): void;
   misses: MissMemory;
@@ -172,17 +189,25 @@ export function createLocator(deps: LocatorDeps): Locator {
     });
   const getStatus = (key: string) => useLocateStatus.getState().byKey[key];
 
+  const hasArea = (trip: Trip) => !!trip.center || trip.spots.some(hasCoords);
+
+  // A destination that cannot be found is not looked up again this session; one that failed
+  // because the service could not be reached is.
   const ensureCenter = (trip: Trip) => {
-    if (trip.center || trip.spots.some(hasCoords) || !trip.destination.trim()) return Promise.resolve();
-    let p = centers.get(trip.id);
+    if (hasArea(trip) || !trip.destination.trim()) return Promise.resolve();
+    const key = `${trip.id}|${trip.destination.trim()}`;
+    let p = centers.get(key);
     if (!p) {
-      p = deps
-        .findCenter(trip.destination)
-        .then((c) => {
+      p = deps.findCenter(trip.destination).then(
+        (c) => {
           if (c) deps.setCenter(trip.id, c);
-        })
-        .catch(() => {});
-      centers.set(trip.id, p);
+        },
+        (err) => {
+          centers.delete(key);
+          throw err;
+        },
+      );
+      centers.set(key, p);
     }
     return p;
   };
@@ -203,11 +228,18 @@ export function createLocator(deps: LocatorDeps): Locator {
         await ensureCenter(trip);
         trip = deps.getTrip(job.tripId) ?? trip;
         spot = trip.spots.find((s) => s.id === job.spotId) ?? spot;
-        const place = await deps.find(spot.name, contextFor(trip, deps.getSettings()));
+        if (!hasArea(trip)) {
+          // Without knowing where the trip is, a same-named place anywhere in the world would
+          // be taken. Wait until the trip has a destination or a located place.
+          queue.shift();
+          setStatus(job.key, 'no-area');
+          continue;
+        }
+        const { place, far } = await deps.find(spot, contextFor(trip, deps.getSettings()));
         queue.shift();
         failures = 0;
         if (!place) {
-          deps.misses.add(job.key);
+          if (!far) deps.misses.add(job.key);
           setStatus(job.key, 'not-found');
         } else if (deps.save(job.tripId, job.spotId, spot.name, { lat: place.lat, lng: place.lng })) {
           setStatus(job.key, 'found');
@@ -251,7 +283,8 @@ export function createLocator(deps: LocatorDeps): Locator {
     for (const spot of trip.spots) {
       if (hasCoords(spot)) continue;
       const key = locateKey(trip.id, spot);
-      if (getStatus(key)) continue;
+      const st = getStatus(key);
+      if (st && !(st === 'no-area' && hasArea(trip))) continue;
       if (isGenericName(spot.name)) {
         setStatus(key, 'skipped');
         continue;

@@ -87,6 +87,13 @@ export async function searchAmap(
   });
 }
 
+/** Centre of a destination; null when nothing is found. Throws when the service cannot be reached. */
+export async function findDestinationCenter(dest: string): Promise<LatLng | null> {
+  if (!dest.trim()) return null;
+  const r = await searchOsm(dest, { limit: 1 });
+  return r[0] ? { lat: r[0].lat, lng: r[0].lng } : null;
+}
+
 /** Best-effort centre of a destination name, for region detection. */
 export async function geocodeDestination(dest: string): Promise<LatLng | null> {
   if (!dest.trim()) return null;

@@ -6,11 +6,25 @@ import type { LatLng } from '../types';
 
 const CJK = /[぀-ヿ㐀-鿿豈-﫿가-힯]/;
 
+// Japanese shinjitai and the simplified Chinese they correspond to, so 心齋橋 matches 心斎橋 and
+// 澀谷站 matches 渋谷駅. Only forms that are not also ordinary Chinese characters.
+const SHINJITAI =
+  '斎斋渋涩軽轻沢泽桜樱薬药浜滨黒黑関关広广稲稻恵惠栄荣県县鉄铁竜龙辺边歩步円圆図图楽乐駅站亜亚悪恶圧压囲围' +
+  '営营塩盐応应拡扩覚觉寛宽歓欢観观気气帰归挙举駆驱経经継继鶏鸡剣剑険险検检験验鉱矿済济歳岁雑杂歯齿児儿実实' +
+  '釈释収收従从獣兽縦纵粛肃処处焼烧証证乗乘浄净剰剩畳叠縄绳壌壤譲让醸酿粋粹酔醉穂穗髄髓瀬濑斉齐摂摄専专戦战' +
+  '銭钱繊纤荘庄捜搜挿插巣巢層层総总騒骚増增蔵藏贈赠臓脏続续対对帯带滝泷択择単单嘆叹団团弾弹遅迟鋳铸庁厅徴征' +
+  '聴听鎮镇転转伝传闘斗徳德読读弐贰悩恼脳脑廃废拝拜売卖発发髪发抜拔晩晚賓宾頻频払拂仏佛併并変变舗铺豊丰毎每' +
+  '満满黙默訳译揺摇様样謡谣頼赖覧览両两猟猎緑绿塁垒涙泪霊灵齢龄暦历歴历労劳録录郷乡隣邻鴎鸥亀龟';
+let shinjitai: Map<string, string> | null = null;
+
 /** Comparable form of a name: simplified Chinese, NFKC, lower case, no spaces, punctuation or symbols. */
 export function normName(s: string): string {
-  return toSimplified(s.normalize('NFKC'))
-    .toLowerCase()
-    .replace(/[\s\p{P}\p{S}]+/gu, '');
+  if (!shinjitai) {
+    shinjitai = new Map();
+    for (let i = 0; i < SHINJITAI.length; i += 2) shinjitai.set(SHINJITAI[i], SHINJITAI[i + 1]);
+  }
+  const folded = [...toSimplified(s.normalize('NFKC'))].map((ch) => shinjitai!.get(ch) ?? ch).join('');
+  return folded.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
 }
 
 // Words that describe an activity rather than a place (compared in normName form).
@@ -73,7 +87,8 @@ export function queryVariants(name: string, max = 3): string[] {
     // "磁浮列車 龍陽路站", "晚餐：南翔饅頭店": the last part names the actual place.
     const parts = noParen.split(/[\s:：・·|｜/、,，]+/).filter((p) => normName(p).length >= 2);
     const last = parts[parts.length - 1];
-    if (last) {
+    // "南翔饅頭店 午餐": a trailing activity word is no place to search for.
+    if (last && !isGenericName(last)) {
       add(last);
       const noStation = last.replace(/(站|駅|車站|车站)$/, '');
       if (noStation !== last) add(noStation);
@@ -145,8 +160,10 @@ export function nameScore(query: string, names: string[]): number {
     if (c === q) return 1;
     const cc = core(c);
     if (cc === qc) return 1;
-    const short = Math.min([...qc].length, [...cc].length);
-    if (short >= 2 && (cc.includes(qc) || qc.includes(cc))) best = Math.max(best, 0.9);
+    const [short, long] = [[...qc].length, [...cc].length].sort((a, b) => a - b);
+    // One name inside the other counts only when it is a good part of it: 东方明珠 in
+    // 东方明珠广播电视 yes, 竹林 in 京都岚山竹林 no.
+    if (short >= 2 && short / long >= 0.4 && (cc.includes(qc) || qc.includes(cc))) best = Math.max(best, 0.9);
     else best = Math.max(best, dice(qc, cc));
   }
   return best;
@@ -162,38 +179,72 @@ export interface Candidate extends LatLng {
 
 /** How far from the rest of the trip a match may be. */
 export const MAX_KM_FROM_TRIP = 300;
+/** A place found only through part of its name ("龍陽路站" for "磁浮列車 龍陽路站") must be closer. */
+export const MAX_KM_PARTIAL = 80;
 export const MIN_NAME_SCORE = 0.5;
 
 const STATION = /(站|駅|station)$/i;
 const STATION_KIND = /railway|station|public_transport|subway|地铁|火车|轻轨|磁浮|车站|機場|机场|aerodrome/i;
 
+export interface PickOptions {
+  /** How far an exact name match may be (a second city of the trip); default MAX_KM_FROM_TRIP. */
+  exactKm?: number;
+  /** The place's address, to prefer the right branch of a chain. */
+  address?: string;
+}
+
+export interface Pick<T> {
+  place: T | null;
+  /** Some result had the right name but was too far from the trip. */
+  far: boolean;
+}
+
 /**
- * Picks the result that is the place: its name must match the spot's name (or the query
- * variant that found it), and it must be within reach of the trip's other places.
+ * Picks the result that is the place: its name must match the spot's name (or, nearby, the
+ * query variant that found it), and it must be within reach of the trip's other places.
  */
-export function pickPlace<T extends Candidate>(
+export function pickPlaceDetailed<T extends Candidate>(
   results: T[],
   spotName: string,
   query: string,
   anchors: LatLng[],
-): T | null {
+  opts: PickOptions = {},
+): Pick<T> {
   let best: { r: T; score: number } | null = null;
+  let far = false;
+  const addr = opts.address ? normName(opts.address) : '';
   for (const r of results) {
     if (!Number.isFinite(r.lat) || !Number.isFinite(r.lng)) continue;
     const names = [r.name, ...(r.names ?? [])];
     const full = nameScore(spotName, names);
     const part = nameScore(query, names);
     if (Math.max(full, part) < MIN_NAME_SCORE) continue;
+    const km = anchors.length ? Math.min(...anchors.map((a) => distanceKm(a, r))) : 0;
+    const limit = full >= MIN_NAME_SCORE ? (full === 1 ? Math.max(opts.exactKm ?? 0, MAX_KM_FROM_TRIP) : MAX_KM_FROM_TRIP) : MAX_KM_PARTIAL;
+    if (km > limit) {
+      far = true;
+      continue;
+    }
     // A result matching the whole name (the right branch of a chain) beats one matching a part.
     const sim = 0.6 * full + 0.4 * part;
-    const km = anchors.length ? Math.min(...anchors.map((a) => distanceKm(a, r))) : 0;
-    if (km > MAX_KM_FROM_TRIP) continue;
     const wantsStation = STATION.test(spotName.trim()) || STATION.test(query.trim());
     const stationBonus = wantsStation && r.kind && STATION_KIND.test(r.kind) ? 0.2 : 0;
-    const score = sim + stationBonus - Math.min(km, MAX_KM_FROM_TRIP) / 3000;
+    const where = 'address' in r && typeof r.address === 'string' ? r.address : '';
+    const addressBonus = addr ? 0.1 * dice(addr, normName(`${where}${names.join('')}`)) : 0;
+    const score = sim + stationBonus + addressBonus - Math.min(km, MAX_KM_FROM_TRIP) / 3000;
     if (!best || score > best.score) best = { r, score };
   }
-  return best?.r ?? null;
+  return { place: best?.r ?? null, far: !best && far };
+}
+
+export function pickPlace<T extends Candidate>(
+  results: T[],
+  spotName: string,
+  query: string,
+  anchors: LatLng[],
+  opts: PickOptions = {},
+): T | null {
+  return pickPlaceDetailed(results, spotName, query, anchors, opts).place;
 }
 
 /** Centre of the places (for biasing a search towards the trip). */

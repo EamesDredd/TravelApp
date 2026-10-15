@@ -54,11 +54,19 @@ export function planMap(
   const pad = opts.pad ?? 40;
   const maxZoom = opts.maxZoom ?? 16;
   // Amap tiles are in GCJ-02 inside mainland China.
-  const toMap = (p: LatLng) => (region === 'cn' ? wgsToGcj(p) : p);
+  const base = (p: LatLng) => (region === 'cn' ? wgsToGcj(p) : p);
+  // A day across the Pacific (Taipei → Los Angeles) is shorter going over the date line:
+  // count western longitudes past 180° so the places sit side by side.
+  const lngs = points.map((p) => base(p).lng);
+  const unwrap = lngs.length > 1 && Math.max(...lngs) - Math.min(...lngs) > 180;
+  const toMap = (p: LatLng) => {
+    const q = base(p);
+    return unwrap && q.lng < 0 ? { ...q, lng: q.lng + 360 } : q;
+  };
   const pts = points.map(toMap);
 
-  let zoom = 3;
-  for (let z = maxZoom; z >= 3; z--) {
+  let zoom = 0;
+  for (let z = maxZoom; z >= 0; z--) {
     const w = pts.map((p) => world(p, z));
     const spanX = (Math.max(...w.map((p) => p.x)) - Math.min(...w.map((p) => p.x))) * k;
     const spanY = (Math.max(...w.map((p) => p.y)) - Math.min(...w.map((p) => p.y))) * k;

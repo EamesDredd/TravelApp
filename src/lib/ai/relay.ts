@@ -46,8 +46,10 @@ function fnv(data: string): string {
 /** Short, stable tag for a trip version (FNV-1a over the editable data, minus cached searches). */
 /**
  * Version of the plan, for telling whether the trip changed since a request was sent or a
- * reply applied. Research and coordinates are facts about places that the app fills in on its
- * own (and keeps when replies replace each other), so they do not count as changes.
+ * reply applied. Research, and coordinates the app found or the user picked (`geo`), are facts
+ * about places that are kept when replies replace each other, so they do not count as changes.
+ * Coordinates the AI gave do count. Spots without `geo` serialise as before this existed, so
+ * fingerprints stored in older chats still match.
  */
 export function tripFingerprint(t: TripSnapshot): string {
   return fnv(
@@ -56,7 +58,11 @@ export function tripFingerprint(t: TripSnapshot): string {
       d: t.destination,
       s: t.startDate ?? null,
       days: t.days,
-      spots: t.spots.map(({ search: _s, lat: _lat, lng: _lng, geo: _g, ...rest }) => rest),
+      spots: t.spots.map(({ search: _s, ...rest }) => {
+        if (!rest.geo) return rest;
+        const { lat: _lat, lng: _lng, geo: _g, ...plan } = rest;
+        return plan;
+      }),
     }),
   );
 }
@@ -485,9 +491,9 @@ function daysMentioned(ops: RelayOp[]): Set<number> {
   return out;
 }
 
-/** Spot fields the plan cares about (research and coordinates are kept separately). */
+/** Spot fields the plan cares about (research, and coordinates the app found, are kept separately). */
 const spotSig = (s: TripSnapshot['spots'][number]) =>
-  JSON.stringify([s.name, s.category, s.address ?? '', s.note ?? '', s.durationMin ?? null]);
+  JSON.stringify([s.name, s.category, s.address ?? '', s.note ?? '', s.durationMin ?? null, s.geo ? null : [s.lat ?? null, s.lng ?? null]]);
 
 /**
  * What the earlier reply changed (base → current) that the new result quietly puts back,

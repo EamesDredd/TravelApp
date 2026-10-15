@@ -2,7 +2,8 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { ChatMessage, Day, LatLng, MapRegion, PlanItem, Settings, Spot, Trip, TripSnapshot } from './types';
 import { hasCoords } from './lib/geo';
-import { keepLocations, makeItem, makeSpot, nameKey, newDay, newTrip, removeSpotEverywhere, resizeDays } from './lib/tripOps';
+import { normName } from './lib/placeMatch';
+import { keepLocations, makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays, withRelocation } from './lib/tripOps';
 
 export const DEFAULT_SETTINGS: Settings = {
   provider: 'relay',
@@ -146,11 +147,14 @@ export const useStore = create<State>()(
           return id;
         },
         updateSpot: (id, patch) =>
-          mutate((t) => ({ ...t, spots: t.spots.map((s) => (s.id === id ? { ...s, ...patch } : s)) })),
+          mutate((t) => ({
+            ...t,
+            spots: t.spots.map((s) => (s.id === id ? { ...s, ...withRelocation(s, patch, (a, b) => normName(a) === normName(b)) } : s)),
+          })),
         setSpotLocation: (tripId, spotId, name, at) => {
           const trip = get().trips.find((t) => t.id === tripId);
           const spot = trip?.spots.find((s) => s.id === spotId);
-          if (!trip || !spot || hasCoords(spot) || nameKey(spot.name) !== nameKey(name)) return false;
+          if (!trip || !spot || hasCoords(spot) || normName(spot.name) !== normName(name)) return false;
           set((st) => ({
             trips: st.trips.map((t) =>
               t.id === tripId

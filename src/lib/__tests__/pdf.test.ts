@@ -221,3 +221,46 @@ describe('buildPdf', () => {
     expect(text).toContain('/Width 10 /Height 14');
   });
 });
+
+describe('after review', () => {
+  it('a URL right after a colon still wraps inside the line', () => {
+    const lines = wrapText('官網:https://www.klook.com/zh-TW/activity/12345-shanghai-tower-ticket/', 200, 10, 400, measure);
+    expect(lines[0].endsWith(':')).toBe(true);
+    for (const l of lines) expect(measure(l, 10, 400)).toBeLessThanOrEqual(200);
+  });
+
+  it('very long notes flow onto the next page instead of off the page', () => {
+    const long = Array.from({ length: 90 }, (_, i) => `第 ${i + 1} 行備註`).join('\n');
+    const t = trip({ spots: SPOTS.map((s) => (s.id === 's_pearl' ? { ...s, note: long } : s)) });
+    const pages = layoutDoc(buildItinerary(t, { days: [0], maps: true, newPagePerDay: false }), measure, { newPagePerDay: false });
+    expect(pages.length).toBeGreaterThan(1);
+    for (const ops of pages) {
+      for (const o of ops) if (o.t === 'text' && !/^\d+ \/ \d+$/.test(o.text) && o.text !== '上海五日遊') expect(o.y).toBeLessThanOrEqual(PAGE.h - PAGE.bottom + 0.01);
+    }
+    expect(pages.flatMap(texts)).toContain('第 90 行備註');
+  });
+
+  it('no "not on the map" note when the PDF has no maps', () => {
+    const doc = buildItinerary(trip(), { days: [0], maps: false, newPagePerDay: false });
+    expect(doc.days[0].unlocated).toEqual([]);
+  });
+
+  it('a day across the Pacific keeps both places on the map', () => {
+    const W = 1546;
+    const H = 570;
+    for (const [a, b] of [
+      [{ lat: 25.08, lng: 121.23 }, { lat: 33.94, lng: -118.41 }], // Taoyuan → Los Angeles
+      [{ lat: -17.76, lng: 177.44 }, { lat: -13.83, lng: -172.01 }], // Nadi → Apia
+    ]) {
+      const plan = planMap([a, b], 'intl', W, H, { tileScale: 2, pad: 66 });
+      for (const p of [a, b]) {
+        const q = plan.project(p);
+        expect(q.x).toBeGreaterThanOrEqual(0);
+        expect(q.x).toBeLessThanOrEqual(W);
+        expect(q.y).toBeGreaterThanOrEqual(0);
+        expect(q.y).toBeLessThanOrEqual(H);
+      }
+      for (const t of plan.tiles) expect(t.url).toMatch(/\/\d+\/\d+\/\d+\.png$/);
+    }
+  });
+});

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { applyToolCall } from '../ai/agentTools';
 import { planRelayApply, tripFingerprint } from '../ai/relay';
 import {
   contextFor,
@@ -11,9 +12,9 @@ import {
   type MissMemory,
 } from '../autoLocate';
 import type { PlaceResult } from '../geocode';
-import { isGenericName, nameScore, normName, pickPlace, queryVariants } from '../placeMatch';
+import { isGenericName, nameScore, normName, pickPlace, pickPlaceDetailed, queryVariants } from '../placeMatch';
 import { toSimplified } from '../t2s';
-import { keepLocations } from '../tripOps';
+import { keepLocations, withRelocation } from '../tripOps';
 import type { LatLng, Spot, Trip, TripSnapshot } from '../../types';
 
 const SHANGHAI = { lat: 31.2304, lng: 121.4737 };
@@ -118,8 +119,8 @@ describe('findPlace', () => {
       calls.push(`${q}|${'bounded' in o && o.bounded ? 'box' : 'any'}`);
       return q === '龍陽路站' ? [place('龙阳路站', 31.203, 121.557, { kind: 'railway:station' })] : [];
     };
-    const r = await findPlace('磁浮列車 龍陽路站', ctx, { osm, amap: async () => [] });
-    expect(r?.name).toBe('龙阳路站');
+    const r = await findPlace({ name: '磁浮列車 龍陽路站' }, ctx, { osm, amap: async () => [] });
+    expect(r.place?.name).toBe('龙阳路站');
     expect(calls).toEqual(['磁浮列車 龍陽路站|box', '龍陽路站|box']);
   });
 
@@ -132,21 +133,21 @@ describe('findPlace', () => {
       osmCalls.push(q);
       return [place('上海浦东国际机场', 31.15, 121.8)];
     };
-    const r = await findPlace('浦東國際機場', { ...ctx, amap: { key: 'k', securityCode: '' } }, { osm, amap });
-    expect(r?.lat).toBe(31.15);
+    const r = await findPlace({ name: '浦東國際機場' }, { ...ctx, amap: { key: 'k', securityCode: '' } }, { osm, amap });
+    expect(r.place?.lat).toBe(31.15);
     expect(osmCalls).toEqual(['浦東國際機場']);
     const fromAmap = await findPlace(
-      '浦東國際機場',
+      { name: '浦東國際機場' },
       { ...ctx, amap: { key: 'k', securityCode: '' } },
       { osm: async () => [], amap: async () => [{ ...place('上海浦东国际机场', 31.14, 121.81), source: 'amap' }] },
     );
-    expect(fromAmap?.source).toBe('amap');
+    expect(fromAmap.place?.source).toBe('amap');
   });
 
   it('returns null when nothing matches, and throws when the service fails', async () => {
-    expect(await findPlace('不存在的地方', ctx, { osm: async () => [], amap: async () => [] })).toBeNull();
+    expect(await findPlace({ name: '不存在的地方' }, ctx, { osm: async () => [], amap: async () => [] })).toEqual({ place: null, far: false });
     await expect(
-      findPlace('豫園', ctx, {
+      findPlace({ name: '豫園' }, ctx, {
         osm: async () => {
           throw new Error('OpenStreetMap 搜尋失敗（429）');
         },
@@ -177,14 +178,16 @@ function mkTrip(spots: Spot[], extra: Partial<Trip> = {}): Trip {
   };
 }
 
-function harness(trip: Trip, find: LocatorDeps['find'], opts: Partial<LocatorDeps> = {}) {
+type SimpleFind = (name: string, ctx: FindContext) => Promise<PlaceResult | null>;
+
+function harness(trip: Trip, find: SimpleFind, opts: Partial<LocatorDeps> = {}) {
   let current = trip;
   const missed = new Set<string>();
   const misses: MissMemory = { has: (k) => missed.has(k), add: (k) => void missed.add(k), delete: (k) => void missed.delete(k) };
   const locator = createLocator({
     getTrip: (id) => (id === current.id ? current : undefined),
     getSettings: () => ({ amapKey: '', amapSecurityCode: '' }),
-    find,
+    find: async (spot, ctx) => ({ place: await find(spot.name, ctx), far: false }),
     save: (tripId, spotId, name, at) => {
       const s = current.spots.find((x) => x.id === spotId);
       if (tripId !== current.id || !s || s.lat !== undefined || s.name !== name) return false;
@@ -426,5 +429,182 @@ describe('relay replies and located places', () => {
     const bund = d.result.trip.spots.find((s) => s.id === 's_bund')!;
     expect(bund).toMatchObject({ lat: 31.25, lng: 121.5 });
     expect(bund.geo).toBeUndefined();
+  });
+});
+
+// ------------------------------------------------------------------ review fixes
+
+describe('matching, after review', () => {
+  it('folds Japanese kanji forms', () => {
+    expect(nameScore('心齋橋', ['心斎橋'])).toBe(1);
+    expect(nameScore('澀谷站', ['渋谷駅'])).toBe(1);
+    expect(nameScore('輕井澤', ['軽井沢'])).toBe(1);
+    expect(nameScore('橫濱中華街', ['横浜中華街'])).toBe(1);
+  });
+
+  it('does not search a trailing activity word', () => {
+    expect(queryVariants('南翔饅頭店 午餐')).not.toContain('午餐');
+  });
+
+  it('a short generic part inside a long name is not a match', () => {
+    const KYOTO = { lat: 35.0116, lng: 135.7681 };
+    expect(nameScore('京都 嵐山 竹林', ['竹林寺'])).toBeLessThan(0.5);
+    // Found only through part of the name: must be near the trip.
+    const farTemple = place('竹林寺', 33.546, 133.578); // Kochi, ~230 km
+    expect(pickPlace([farTemple], '京都 嵐山 竹林', '竹林', [KYOTO])).toBeNull();
+    const station = place('龙阳路', 31.203, 121.557, { kind: 'railway:station' });
+    expect(pickPlace([station], '磁浮列車 龍陽路站', '龍陽路站', [SHANGHAI])).toBe(station);
+  });
+
+  it('an exact name may be in the trip\'s second city; reports matches rejected only for distance', () => {
+    const TOKYO = { lat: 35.68, lng: 139.76 };
+    const osakaCastle = place('大阪城', 34.6873, 135.5259);
+    expect(pickPlace([osakaCastle], '大阪城', '大阪城', [TOKYO])).toBeNull();
+    expect(pickPlace([osakaCastle], '大阪城', '大阪城', [TOKYO], { exactKm: 1000 })).toBe(osakaCastle);
+    expect(pickPlaceDetailed([osakaCastle], '大阪城', '大阪城', [TOKYO])).toEqual({ place: null, far: true });
+  });
+
+  it('prefers the branch at the given address', () => {
+    const umeda = place('一蘭 梅田店', 34.70, 135.50, { address: '大阪市北区角田町' });
+    const dotonbori = place('一蘭 道頓堀店', 34.668, 135.502, { address: '大阪市中央区道頓堀' });
+    const OSAKA = { lat: 34.69, lng: 135.5 };
+    expect(pickPlace([umeda, dotonbori], '一蘭', '一蘭', [OSAKA], { address: '大阪市中央區道頓堀1-4-16' })).toBe(dotonbori);
+  });
+});
+
+describe('locator, after review', () => {
+  beforeEach(() => useLocateStatus.setState({ byKey: {} }));
+
+  it('does not search anywhere in the world when the trip has no area', async () => {
+    let calls = 0;
+    const h = harness(
+      mkTrip([spot('a', '城隍廟')], { destination: '東京大阪' }),
+      async () => {
+        calls++;
+        return place('城隍庙', 24.8, 120.97);
+      },
+      { findCenter: async () => null },
+    );
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(calls).toBe(0);
+    expect(h.status('a')).toBe('no-area');
+    expect(h.trip.spots[0].lat).toBeUndefined();
+    // Once one place is located by hand, the rest are searched.
+    h.trip = { ...h.trip, spots: [...h.trip.spots, { ...spot('b', '外灘', SHANGHAI), geo: 'manual' }] };
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(calls).toBe(1);
+  });
+
+  it('looks the destination up again when the service failed', async () => {
+    let attempts = 0;
+    const h = harness(mkTrip([spot('a', '豫園')]), async () => null, {
+      findCenter: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error('offline');
+        return SHANGHAI;
+      },
+    });
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(h.status('a')).toBe('queued');
+    await new Promise((r) => setTimeout(r, 30));
+    await h.locator.idle();
+    expect(attempts).toBe(2);
+    expect(h.trip.center).toEqual(SHANGHAI);
+    expect(h.status('a')).toBe('not-found');
+  });
+
+  it('a place rejected only for being far is not remembered as missing', async () => {
+    const h = harness(mkTrip([spot('a', '大阪城'), spot('b', '淺草寺', { lat: 35.7148, lng: 139.7967 })]), async () => null, {
+      find: async () => ({ place: null, far: true }),
+    });
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(h.status('a')).toBe('not-found');
+    expect(h.missed.size).toBe(0);
+  });
+
+  it('findPlace accepts an exact match in a second city through the wider search', async () => {
+    const TOKYO = { lat: 35.68, lng: 139.76 };
+    const osm = async (_q: string, o: { bounded?: boolean } | LatLng = {}) =>
+      'bounded' in o && o.bounded ? [] : [place('大阪城', 34.6873, 135.5259)];
+    const r = await findPlace({ name: '大阪城' }, { region: 'intl', destination: '東京', anchors: [TOKYO], center: TOKYO }, { osm, amap: async () => [] });
+    expect(r.place?.name).toBe('大阪城');
+  });
+});
+
+describe('locations, after review', () => {
+  it('undo does not keep coordinates the AI gave', () => {
+    const before = snap([spot('a', '金閣寺')]);
+    const now = snap([spot('a', '金閣寺', { lat: 10, lng: 10 })]);
+    expect(keepLocations(before, now, true).spots[0].lat).toBeUndefined();
+  });
+
+  it('a hand-picked location brings its address when restoring', () => {
+    const before = snap([{ ...spot('a', '清水寺', { lat: 1, lng: 1 }), address: '舊地址' }]);
+    const now = snap([{ ...spot('a', '清水寺', { lat: 34.99, lng: 135.78 }), geo: 'manual', address: '京都市東山區' }]);
+    expect(keepLocations(before, now, true).spots[0]).toMatchObject({ lat: 34.99, geo: 'manual', address: '京都市東山區' });
+  });
+
+  it('renaming an automatically located place drops its coordinates', () => {
+    const s: Spot = { ...spot('a', '城隍廟', { lat: 24.8, lng: 120.97 }), geo: 'auto' };
+    const same = (x: string, y: string) => normName(x) === normName(y);
+    expect(withRelocation(s, { name: '台北霞海城隍廟' }, same)).toMatchObject({ name: '台北霞海城隍廟', lat: undefined, geo: undefined });
+    expect(withRelocation(s, { name: '城隍庙' }, same)).toEqual({ name: '城隍庙' });
+    expect(withRelocation({ ...s, geo: 'manual' }, { name: '別的' }, same)).toEqual({ name: '別的' });
+    expect(withRelocation(s, { name: '別的', lat: 1, lng: 2 }, same)).toEqual({ name: '別的', lat: 1, lng: 2 });
+  });
+
+  it('the AI repeating a guessed location keeps the guess marker; new coordinates clear it', () => {
+    const t = snap([{ ...spot('a', '豫園', { lat: 31.22721, lng: 121.49211 }), geo: 'auto' }]);
+    const echo = applyToolCall(t, 'update_spots', { updates: [{ spot_id: 'a', lat: 31.22721, lng: 121.49211, note: '早上去' }] });
+    expect(echo.trip.spots[0]).toMatchObject({ geo: 'auto', note: '早上去' });
+    const moved = applyToolCall(t, 'update_spots', { updates: [{ spot_id: 'a', lat: 31.2272, lng: 121.4925 }] });
+    expect(moved.trip.spots[0].geo).toBeUndefined();
+    const renamed = applyToolCall(t, 'update_spots', { updates: [{ spot_id: 'a', name: '城隍廟' }] });
+    expect(renamed.trip.spots[0].lat).toBeUndefined();
+  });
+});
+
+describe('relay fingerprints, after review', () => {
+  const block = (obj: unknown) => '```travelplan\n' + JSON.stringify(obj) + '\n```';
+
+  it('trips without located places fingerprint exactly as before the update', () => {
+    // The formula before auto-locate: everything but research.
+    const t = snap([spot('a', '外灘', { lat: 31.24, lng: 121.49 }), { ...spot('b', '豫園'), search: { summary: 'x', sources: [], provider: 'p', at: 1 } }]);
+    expect(tripFingerprint(t)).toBe(tripFingerprint({ ...t, spots: t.spots.map(({ search: _s, ...r }) => r) }));
+    expect(tripFingerprint(t)).not.toBe(tripFingerprint({ ...t, spots: [spot('a', '外灘', { lat: 31.25, lng: 121.49 }), spot('b', '豫園')] }));
+  });
+
+  it("another request's AI coordinate fix counts as an edit before an older reply is replaced", () => {
+    let t: Trip = { ...mkTrip([{ ...spot('x', '清水寺', { lat: 35.5, lng: 136 }), geo: 'auto' }]), days: [{ id: 'd1', items: [] }] };
+    t = { ...t, chat: [{ id: 'u0', role: 'user', text: 'r1', at: 0, relay: { tag: 'aaaaaa', fp: tripFingerprint(t) } }] };
+    const r1 = (rev: number) => `好\n${block({ base: 'aaaaaa', rev, ops: [{ tool: 'set_day_plans', input: { days: [{ day: 1, items: [{ spot_id: 'x' }] }] } }] })}`;
+    const d1 = planRelayApply(r1(1), t, []);
+    if (d1.kind !== 'apply') throw new Error(d1.kind);
+    t = { ...t, ...d1.result.trip, chat: [...t.chat, { id: 'a1', role: 'assistant', text: '', at: 0, relayBase: 'aaaaaa', relayRev: 1, relayResult: tripFingerprint(d1.result.trip), relayOps: d1.opsFp, relayStart: d1.requestBase, undo: d1.before }] };
+    // Request B fixes the coordinates.
+    const fix = applyToolCall(t, 'update_spots', { updates: [{ spot_id: 'x', lat: 34.9949, lng: 135.785 }] });
+    t = { ...t, ...fix.trip };
+    const d2 = planRelayApply(r1(2), t, []);
+    if (d2.kind !== 'apply') throw new Error(d2.kind);
+    expect(d2.confirm).toBe('edited-after-reply');
+    expect(d2.result.trip.spots[0]).toMatchObject({ lat: 34.9949, lng: 135.785 });
+  });
+
+  it('a newer version that drops an earlier coordinate fix is reported', () => {
+    let t: Trip = { ...mkTrip([{ ...spot('x', '清水寺', { lat: 35.5, lng: 136 }), geo: 'auto' }]), days: [{ id: 'd1', items: [] }] };
+    t = { ...t, chat: [{ id: 'u0', role: 'user', text: 'r', at: 0, relay: { tag: 'aaaaaa', fp: tripFingerprint(t) } }] };
+    const v1 = `好\n${block({ base: 'aaaaaa', rev: 1, ops: [{ tool: 'update_spots', input: { updates: [{ spot_id: 'x', lat: 34.9949, lng: 135.785 }] } }, { tool: 'set_day_plans', input: { days: [{ day: 1, items: [{ spot_id: 'x' }] }] } }] })}`;
+    const d1 = planRelayApply(v1, t, []);
+    if (d1.kind !== 'apply') throw new Error(d1.kind);
+    t = { ...t, ...d1.result.trip, chat: [...t.chat, { id: 'a1', role: 'assistant', text: '', at: 0, relayBase: 'aaaaaa', relayRev: 1, relayResult: tripFingerprint(d1.result.trip), relayOps: d1.opsFp, relayStart: d1.requestBase, undo: d1.before }] };
+    const v2 = `好\n${block({ base: 'aaaaaa', rev: 2, ops: [{ tool: 'set_day_plans', input: { days: [{ day: 1, items: [{ spot_id: 'x' }] }] } }] })}`;
+    const d2 = planRelayApply(v2, t, []);
+    if (d2.kind !== 'apply') throw new Error(d2.kind);
+    expect(d2.replaces).toBe('a1');
+    expect(d2.dropped).toEqual(['「清水寺」先前改過的資料會還原']);
   });
 });

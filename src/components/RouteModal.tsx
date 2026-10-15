@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { amapCityCode, loadAmap, type AMapNS } from '../lib/amap';
 import { locateKey, useLocateStatus } from '../lib/autoLocate';
+import { useOnline } from '../lib/online';
 import { distanceKm, estimateMinutes, formatKm, formatMinutes, hasCoords, stopsRegion, wgsToGcj } from '../lib/geo';
 import {
   amapNavigationUrl,
@@ -79,9 +80,14 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
   const perLeg = legs.length > 0 && (mode === 'transit' || (mode === 'walking' && region === 'cn'));
   const missing = stops.filter((s) => !hasCoords(s));
   const statuses = useLocateStatus((s) => s.byKey);
-  const busy = (s: Spot) => ['queued', 'locating'].includes(statuses[locateKey(trip.id, s)] ?? '');
+  const online = useOnline();
+  const statusOf = (s: Spot) => statuses[locateKey(trip.id, s)];
+  const waiting = (s: Spot) => ['queued', 'locating'].includes(statusOf(s) ?? '');
+  const busy = (s: Spot) => online && waiting(s);
   const locating = missing.filter(busy);
-  const unfound = missing.filter((s) => !busy(s));
+  const offline = online ? [] : missing.filter(waiting);
+  const unfound = missing.filter((s) => !waiting(s));
+  const noArea = unfound.some((s) => statusOf(s) === 'no-area');
   const guessed = stops.filter((s) => hasCoords(s) && s.geo === 'auto');
   const ui = useUI();
   const amapReady = region === 'cn' && !!settings.amapKey.trim();
@@ -139,9 +145,15 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
           <span className="spinner" /> 正在自動定位：{locating.map((s) => s.name).join('、')}…
         </p>
       )}
+      {offline.length > 0 && <p className="hint">📴 沒有網路，連線後會自動定位：{offline.map((s) => s.name).join('、')}</p>}
       {unfound.length > 0 && (
         <div className="notice" style={{ marginTop: 8 }}>
-          ⚠️ 找不到位置，路線少了這些地點：{unfound.map((s) => s.name).join('、')}
+          ⚠️ {noArea ? '還沒有座標，路線少了這些地點' : '找不到位置，路線少了這些地點'}：{unfound.map((s) => s.name).join('、')}
+          {noArea && (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              App 還不知道這趟旅程在哪裡。到「我的旅程」填寫目的地，或先手動定位一個地點，其他地點就會自動定位。
+            </div>
+          )}
           <div className="row-wrap" style={{ marginTop: 8 }}>
             {unfound.map((s) => (
               <button key={s.id} className="btn btn-sm" onClick={() => ui.openAddSpot({ locateId: s.id })}>

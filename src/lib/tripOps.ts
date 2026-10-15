@@ -84,11 +84,12 @@ export function removeSpotEverywhere<T extends TripSnapshot>(trip: T, spotId: st
 export const nameKey = (n: string) => n.replace(/\s+/g, '').toLowerCase();
 
 /**
- * Locations are facts about places, not plan decisions. When `target` (a snapshot being
- * restored or applied) has no coordinates for a place the current trip has already located,
- * keep them. With `keepManual` (restoring or re-applying an older version), a location the
- * user picked by hand also wins over the older coordinates. Matches by id (same name), or by
- * name for places `target` re-created under a new id.
+ * Locations the app found or the user picked (`geo`) are facts about places, not plan
+ * decisions. When `target` (a snapshot being restored or applied) has no coordinates for a
+ * place the current trip has located that way, keep them; coordinates the AI gave are part of
+ * its change and are not kept. With `keepManual` (restoring or re-applying an older version), a
+ * location the user picked by hand, and the address picked with it, also wins over older ones.
+ * Matches by id (same name), or by name for places `target` re-created under a new id.
  */
 export function keepLocations<T extends TripSnapshot>(target: T, current: TripSnapshot, keepManual = false): T {
   const byId = new Map(current.spots.map((s) => [s.id, s]));
@@ -100,14 +101,23 @@ export function keepLocations<T extends TripSnapshot>(target: T, current: TripSn
   const spots = target.spots.map((s) => {
     const same = byId.get(s.id);
     const cur = same ? (nameKey(same.name) === nameKey(s.name) ? same : undefined) : byName.get(nameKey(s.name));
-    if (!cur || !hasCoords(cur)) return s;
-    if (hasCoords(s) && !(keepManual && cur.geo === 'manual')) return s;
-    if (s.lat === cur.lat && s.lng === cur.lng && s.geo === cur.geo) return s;
+    if (!cur || !hasCoords(cur) || !cur.geo) return s;
+    const manual = keepManual && cur.geo === 'manual';
+    if (hasCoords(s) && !manual) return s;
+    const address = manual && cur.address ? cur.address : s.address;
+    if (s.lat === cur.lat && s.lng === cur.lng && s.geo === cur.geo && s.address === address) return s;
     changed = true;
-    const next: Spot = { ...s, lat: cur.lat, lng: cur.lng };
-    if (cur.geo) next.geo = cur.geo;
-    else delete next.geo;
-    return next;
+    return { ...s, lat: cur.lat, lng: cur.lng, geo: cur.geo, ...(address !== undefined ? { address } : {}) };
   });
   return changed ? { ...target, spots } : target;
+}
+
+/**
+ * A patch that renames a place the app located automatically, without giving coordinates,
+ * also drops those coordinates: they were found for the old name. The place is then located
+ * again under its new name.
+ */
+export function withRelocation(spot: Spot, patch: Partial<Spot>, sameName: (a: string, b: string) => boolean): Partial<Spot> {
+  if (spot.geo !== 'auto' || patch.name === undefined || sameName(patch.name, spot.name) || 'lat' in patch) return patch;
+  return { ...patch, lat: undefined, lng: undefined, geo: undefined };
 }
