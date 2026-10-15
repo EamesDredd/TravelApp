@@ -3,6 +3,7 @@ import { AddSpotModal } from './components/AddSpotModal';
 import { CandidatePool } from './components/CandidatePool';
 import { ChatPanel } from './components/ChatPanel';
 import { DayPlan } from './components/DayPlan';
+import { ExportPdfModal } from './components/ExportPdfModal';
 import { DayPickerModal, SpotPickerModal } from './components/Pickers';
 import { RouteModal } from './components/RouteModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -67,6 +68,7 @@ export default function App() {
       <DayPickerModal />
       <SpotPickerModal />
       <TripsModal />
+      <ExportPdfModal />
       <SettingsModal />
       {toast && <div className="toast">{toast}</div>}
     </>
@@ -132,6 +134,9 @@ function TopBar() {
       <button className="trip-btn" onClick={() => ui.openTrips(true)}>
         <span className="trip-name">{trip.name} ▾</span>
         <span className="trip-sub">{sub}</span>
+      </button>
+      <button className="icon-btn" aria-label="匯出 PDF" title="匯出 PDF 行程表" onClick={() => ui.openPdfExport({})}>
+        📄
       </button>
       <button className="icon-btn" aria-label="設定" onClick={() => ui.openSettings(true)}>
         ⚙

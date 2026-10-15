@@ -249,6 +249,15 @@ function TripsInner() {
 
           <h3 style={{ marginTop: 16 }}>分享與備份</h3>
           <div className="row-wrap">
+            <button
+              className="btn btn-sm"
+              onClick={() => {
+                close();
+                ui.openPdfExport({});
+              }}
+            >
+              📄 匯出 PDF 行程表
+            </button>
             <button className="btn btn-sm" onClick={share}>
               🔗 分享連結（傳到手機）
             </button>

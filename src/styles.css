@@ -1100,6 +1100,8 @@ button.chip {
 }
 
 .spinner {
+  display: inline-block;
+  vertical-align: -2px;
   width: 14px;
   height: 14px;
   border-radius: 50%;
