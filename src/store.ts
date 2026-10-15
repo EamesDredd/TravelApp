@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { ChatMessage, Day, MapRegion, PlanItem, Settings, Spot, Trip, TripSnapshot } from './types';
-import { makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays } from './lib/tripOps';
+import type { ChatMessage, Day, LatLng, MapRegion, PlanItem, Settings, Spot, Trip, TripSnapshot } from './types';
+import { hasCoords } from './lib/geo';
+import { normName } from './lib/placeMatch';
+import { keepLocations, makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays, withRelocation } from './lib/tripOps';
 
 export const DEFAULT_SETTINGS: Settings = {
   provider: 'relay',
@@ -14,6 +16,7 @@ export const DEFAULT_SETTINGS: Settings = {
   googleMapsKey: '',
   amapKey: '',
   amapSecurityCode: '',
+  preferMapApps: true,
 };
 
 /** Keep undo snapshots only on the most recent assistant turns so storage stays small. */
@@ -41,11 +44,20 @@ interface State {
   deleteTrip(id: string): void;
   updateTrip(patch: Partial<Pick<Trip, 'name' | 'destination' | 'startDate' | 'mapRegion' | 'center'>>): void;
   setDayCount(n: number): void;
-  /** Replace the editable parts of the trip (used by the AI agent and undo). */
-  replaceSnapshot(s: TripSnapshot): void;
+  /**
+   * Replace the editable parts of the trip (used by the AI agent and undo). Coordinates found
+   * since `s` was taken are kept; with `restore` (undo) so is a location the user picked by hand.
+   */
+  replaceSnapshot(s: TripSnapshot, opts?: { restore?: boolean }): void;
 
   addSpot(fields: Omit<Spot, 'id'>): string;
   updateSpot(id: string, patch: Partial<Omit<Spot, 'id'>>): void;
+  /**
+   * Saves an automatically found location into a trip (not necessarily the open one), only
+   * if the place still has that name and no coordinates. Returns whether it was saved.
+   */
+  setSpotLocation(tripId: string, spotId: string, name: string, at: LatLng): boolean;
+  setTripCenter(tripId: string, center: LatLng): void;
   removeSpot(id: string): void;
 
   addDay(at?: number): void;
@@ -118,8 +130,8 @@ export const useStore = create<State>()(
           mutate((t) => ({ ...t, days: resizeDays(t.days, n) }));
           set((st) => ({ selectedDay: Math.min(st.selectedDay, n - 1) }));
         },
-        replaceSnapshot: (s) => {
-          mutate((t) => ({ ...t, ...structuredClone(s) }));
+        replaceSnapshot: (s, opts) => {
+          mutate((t) => ({ ...t, ...structuredClone(keepLocations(s, t, !!opts?.restore)) }));
           set((st) => {
             const trip = st.trips.find((t) => t.id === st.currentTripId);
             return trip && st.selectedDay >= trip.days.length ? { selectedDay: trip.days.length - 1 } : {};
@@ -136,7 +148,28 @@ export const useStore = create<State>()(
           return id;
         },
         updateSpot: (id, patch) =>
-          mutate((t) => ({ ...t, spots: t.spots.map((s) => (s.id === id ? { ...s, ...patch } : s)) })),
+          mutate((t) => ({
+            ...t,
+            spots: t.spots.map((s) => (s.id === id ? { ...s, ...withRelocation(s, patch, (a, b) => normName(a) === normName(b)) } : s)),
+          })),
+        setSpotLocation: (tripId, spotId, name, at) => {
+          const trip = get().trips.find((t) => t.id === tripId);
+          const spot = trip?.spots.find((s) => s.id === spotId);
+          if (!trip || !spot || hasCoords(spot) || normName(spot.name) !== normName(name)) return false;
+          set((st) => ({
+            trips: st.trips.map((t) =>
+              t.id === tripId
+                ? touch({
+                    ...t,
+                    spots: t.spots.map((s) => (s.id === spotId ? { ...s, lat: at.lat, lng: at.lng, geo: 'auto' as const } : s)),
+                  })
+                : t,
+            ),
+          }));
+          return true;
+        },
+        setTripCenter: (tripId, center) =>
+          set((st) => ({ trips: st.trips.map((t) => (t.id === tripId ? { ...t, center } : t)) })),
         removeSpot: (id) => mutate((t) => removeSpotEverywhere(t, id)),
 
         addDay: (at) =>

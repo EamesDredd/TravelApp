@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { FriendlyError, listModels } from '../lib/ai';
+import { forgetAnswers } from '../lib/openApp';
 import { useStore } from '../store';
 import type { Settings } from '../types';
 import { useUI } from '../ui';
@@ -235,6 +236,26 @@ function SettingsInner() {
             </p>
           </>
         )}
+      </div>
+
+      <div className="section">
+        <h3>地圖連結</h3>
+        <label className="row small" style={{ marginBottom: 6 }}>
+          <input type="checkbox" checked={draft.preferMapApps} onChange={(e) => set({ preferMapApps: e.target.checked })} />
+          手機有安裝 Google 地圖／高德地圖 App 時，用 App 開啟
+        </label>
+        <p className="hint">
+          Android 會自動判斷，沒裝 App 就開網頁版。iPhone 無法自動判斷，第一次點地圖連結時會問一次是否已安裝並記住。
+          <button
+            className="linklike"
+            onClick={() => {
+              forgetAnswers();
+              useUI.getState().showToast('下次點地圖連結時會重新詢問');
+            }}
+          >
+            重新詢問
+          </button>
+        </p>
       </div>
 
       <details className="more section">

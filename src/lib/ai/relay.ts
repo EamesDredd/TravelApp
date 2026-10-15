@@ -4,7 +4,7 @@
  * current trip when the user pastes the reply back. Everything here is pure,
  * so the decision logic is unit-tested; ChatPanel only asks and commits. */
 import type { ChatMessage, Trip, TripSnapshot } from '../../types';
-import { snapshotOf } from '../tripOps';
+import { keepLocations, nameKey, snapshotOf } from '../tripOps';
 import { applyToolCall, describeTrip, TOOL_DEFS } from './agentTools';
 
 export const RELAY_FENCE = 'travelplan';
@@ -44,6 +44,13 @@ function fnv(data: string): string {
 }
 
 /** Short, stable tag for a trip version (FNV-1a over the editable data, minus cached searches). */
+/**
+ * Version of the plan, for telling whether the trip changed since a request was sent or a
+ * reply applied. Research, and coordinates the app found or the user picked (`geo`), are facts
+ * about places that are kept when replies replace each other, so they do not count as changes.
+ * Coordinates the AI gave do count. Spots without `geo` serialise as before this existed, so
+ * fingerprints stored in older chats still match.
+ */
 export function tripFingerprint(t: TripSnapshot): string {
   return fnv(
     JSON.stringify({
@@ -51,7 +58,21 @@ export function tripFingerprint(t: TripSnapshot): string {
       d: t.destination,
       s: t.startDate ?? null,
       days: t.days,
-      spots: t.spots.map(({ search: _search, ...rest }) => rest),
+      spots: t.spots.map(({ search: _s, ...rest }) => {
+        if (!rest.geo) return rest;
+        const { lat: _lat, lng: _lng, geo: _g, ...plan } = rest;
+        return plan;
+      }),
+    }),
+  );
+}
+
+/** Everything the user sees, coordinates included: whether applying a reply changes anything. */
+export function contentFingerprint(t: TripSnapshot): string {
+  return fnv(
+    JSON.stringify({
+      f: tripFingerprint(t),
+      c: t.spots.map((s) => [s.id, s.lat ?? null, s.lng ?? null]),
     }),
   );
 }
@@ -74,7 +95,7 @@ export function newRelayTag(): string {
 const RULES = `- 「目前行程狀態」裡的資料以這則訊息為準。
 - 我要你安排、調整、新增或刪除時，直接給出修改區塊，不必先問我；只是詢問意見或資訊時，用文字回答就好，不要附修改區塊。
 - 依遠近安排時，用候選地點的座標把鄰近的地點排在同一天，依順路的動線排序、避免來回折返；考慮開放時間、停留時間、交通時間與用餐時段（早餐約 07:00–09:30、午餐 11:30–13:30、晚餐 17:30–20:00），填入合理的開始時間。
-- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時，在 set_day_plans 的項目裡用 new_spot，並一定要寫 name 和 category，盡量附上地址與大略座標；不確定的座標寧可省略。App 會依名稱把同名的地點視為同一個，所以同一個新地點在不同天出現時，new_spot 的 name 要寫得一模一樣。
+- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時，在 set_day_plans 的項目裡用 new_spot，並一定要寫 name 和 category，盡量附上地址與座標（lat、lng，WGS-84；知名景點、車站、機場通常都知道）；不確定的座標寧可省略，App 會依名稱自動定位，所以 name 要寫成地圖找得到的完整名稱（例如「上海浦東國際機場」，不要只寫「機場」）。App 會依名稱把同名的地點視為同一個，所以同一個新地點在不同天出現時，new_spot 的 name 要寫得一模一樣。
 - add_candidates 只用在「加入候選但先不排進行程」的地點。
 - set_day_plans 會用你給的清單完整取代那一天，所以要列出那天所有項目，包含原本要保留的。
 - 一天不要排得太滿，保留彈性時間。
@@ -435,16 +456,22 @@ export type RelayDecision =
       onCurrentIssues?: string[];
     };
 
-const nameKey = (n: string) => n.replace(/\s+/g, '').toLowerCase();
-
-/** Keeps place research saved since `base` was taken (it is not part of the plan), matching by id or name. */
-function withResearch(target: TripSnapshot, current: TripSnapshot): TripSnapshot {
+/**
+ * Keeps what the app learned about places since `target` was taken (it is not part of the plan):
+ * research, matched by id or name, and coordinates located since then (see keepLocations;
+ * `older` when `target` builds on an older version than `current`).
+ */
+function withFacts(target: TripSnapshot, current: TripSnapshot, older: boolean): TripSnapshot {
   const byId = new Map(current.spots.filter((s) => s.search).map((s) => [s.id, s.search]));
   const byName = new Map(current.spots.filter((s) => s.search).map((s) => [nameKey(s.name), s.search]));
-  return {
-    ...target,
-    spots: target.spots.map((s) => (s.search ? s : { ...s, search: byId.get(s.id) ?? byName.get(nameKey(s.name)) ?? s.search })),
-  };
+  return keepLocations(
+    {
+      ...target,
+      spots: target.spots.map((s) => (s.search ? s : { ...s, search: byId.get(s.id) ?? byName.get(nameKey(s.name)) ?? s.search })),
+    },
+    current,
+    older,
+  );
 }
 
 /** A day described by place names (new places get new ids each time a block is applied). */
@@ -464,9 +491,9 @@ function daysMentioned(ops: RelayOp[]): Set<number> {
   return out;
 }
 
-/** Spot fields the plan cares about (research is kept separately). */
+/** Spot fields the plan cares about (research, and coordinates the app found, are kept separately). */
 const spotSig = (s: TripSnapshot['spots'][number]) =>
-  JSON.stringify([s.name, s.category, s.address ?? '', s.lat ?? null, s.lng ?? null, s.note ?? '', s.durationMin ?? null]);
+  JSON.stringify([s.name, s.category, s.address ?? '', s.note ?? '', s.durationMin ?? null, s.geo ? null : [s.lat ?? null, s.lng ?? null]]);
 
 /**
  * What the earlier reply changed (base → current) that the new result quietly puts back,
@@ -581,7 +608,7 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
   } else if (latest) {
     if (canReplace) {
       requestBase = latest.relayStart!;
-      start = withResearch(requestBase, current);
+      start = withFacts(requestBase, current, true);
       replaces = latest.id;
       if (parsed.rev && latest.relayRev && parsed.rev < latest.relayRev) confirm = 'older-version';
     } else {
@@ -594,7 +621,7 @@ export function planRelayApply(raw: string, trip: Trip, otherTrips: Pick<Trip, '
   const applyAt = (from: TripSnapshot) => {
     const r = applyRelayOps(from, parsed.ops!);
     const trip = from === current ? r.trip : keepPlaceIds(r.trip, requestBase, current);
-    return { ...r, trip: withResearch(trip, current) };
+    return { ...r, trip: withFacts(trip, current, from !== current) };
   };
   const result = applyAt(start);
   const dropped = replaces && parsed.ops.length ? droppedChanges(requestBase, current, result.trip, parsed.ops) : [];

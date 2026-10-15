@@ -3,7 +3,8 @@
 import type { Category, Day, PlanItem, Spot, TripSnapshot } from '../../types';
 import { CATEGORY_LABEL } from '../../types';
 import { hasCoords, isMainlandChina } from '../geo';
-import { isCategory, makeItem, makeSpot, resizeDays, scheduledDays } from '../tripOps';
+import { normName } from '../placeMatch';
+import { isCategory, makeItem, makeSpot, resizeDays, scheduledDays, withRelocation } from '../tripOps';
 import { formatDayDate, normalizeTime, parseDate, toIsoDate, weekdayName } from '../util';
 
 export interface ToolDef {
@@ -20,8 +21,8 @@ const SPOT_FIELDS = {
     description: 'sight=景點、breakfast=早餐、meal=午餐或晚餐',
   },
   address: { type: 'string', description: '地址，或至少「城市 區域」，用於地圖搜尋' },
-  lat: { type: 'number', description: '緯度（WGS-84）。不確定就省略' },
-  lng: { type: 'number', description: '經度（WGS-84）。不確定就省略' },
+  lat: { type: 'number', description: '緯度（WGS-84）。知道就附上；不確定可省略，App 會依名稱自動定位' },
+  lng: { type: 'number', description: '經度（WGS-84）。知道就附上；不確定可省略，App 會依名稱自動定位' },
   note: { type: 'string', description: '簡短備註，例如特色、營業時間、預約提醒' },
   duration_min: { type: 'integer', description: '建議停留分鐘數' },
 };
@@ -127,7 +128,7 @@ App 的資料：
 - 使用者要你安排、調整、新增或刪除時，直接用工具修改，不必再徵求同意；改完用幾句話說明做了什麼（例如每天的主軸與排序理由）。
 - 使用者只是詢問意見或資訊時，先用文字回答，不要擅自修改行程。
 - 依遠近安排時，用候選地點的座標把鄰近的地點排在同一天，並依順路的動線排序、避免來回折返；同時考慮開放時間、停留時間、交通時間與用餐時段（早餐約 07:00–09:30、午餐 11:30–13:30、晚餐 17:30–20:00），填入合理的開始時間。
-- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時用 new_spot，盡量附上地址與大略座標；不確定的座標寧可省略也不要亂猜。
+- 優先使用既有候選地點的 spot_id。需要新地點（例如補上順路的餐廳）時用 new_spot，盡量附上地址與座標（WGS-84；知名景點、車站、機場通常都知道）；不確定的座標寧可省略也不要亂猜，App 會依名稱自動定位，所以名稱要寫成地圖找得到的完整名稱（例如「上海浦東國際機場」、「小楊生煎 黃河路店」，不要只寫「機場」、「午餐」）。
 - set_day_plans 會用你給的清單完整取代那一天，所以要列出那天所有項目，包含原本要保留的。
 - 一天不要排得太滿，保留彈性時間。
 - 回答使用繁體中文（台灣用語），精簡、以條列為主。`;
@@ -137,7 +138,8 @@ export const WEB_SEARCH_NOTE = '\n- 需要最新資訊（營業時間、票價�
 // ------------------------------------------------------------------ state text
 
 function fmtCoord(s: Spot): string {
-  return hasCoords(s) ? `${s.lat!.toFixed(5)},${s.lng!.toFixed(5)}` : '（無座標）';
+  if (!hasCoords(s)) return '（無座標）';
+  return `${s.lat!.toFixed(5)},${s.lng!.toFixed(5)}${s.geo === 'auto' ? '（App 依名稱自動定位，可能不準）' : ''}`;
 }
 
 export function describeDay(trip: TripSnapshot, i: number): string {
@@ -419,6 +421,15 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
     if (lat !== undefined && lng !== undefined) {
       patch.lat = lat;
       patch.lng = lng;
+      // Given by the AI, no longer the app's own guess, unless it only repeats the coordinates
+      // it was shown.
+      const same = hasCoords(spot) && Math.abs(spot.lat - lat) < 1e-4 && Math.abs(spot.lng - lng) < 1e-4;
+      if (!same) patch.geo = undefined;
+      else if (patch.name !== undefined && normName(patch.name) !== normName(spot.name)) {
+        // Renamed, with the coordinates it was shown: those were found for the old name.
+        delete patch.lat;
+        delete patch.lng;
+      }
     } else if (lat !== undefined || lng !== undefined) {
       errors.push(`${id} 的座標要同時提供 lat 和 lng`);
     }
@@ -428,7 +439,8 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
       errors.push(`${id} 沒有可以更新的欄位`);
       continue;
     }
-    next = { ...next, spots: next.spots.map((s) => (s.id === id ? { ...s, ...patch } : s)) };
+    const applied = withRelocation(spot, patch, (a, b) => normName(a) === normName(b));
+    next = { ...next, spots: next.spots.map((s) => (s.id === id ? { ...s, ...applied } : s)) };
     edited++;
     done.push(`已更新 ${id} ${patch.name ?? spot.name}`);
   }

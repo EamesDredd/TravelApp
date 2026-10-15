@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { aiConfigured, FriendlyError, providerLabel, searchSpot, spotSearchIsLive, spotSearchPrompt } from '../lib/ai';
 import { buildRelaySearchPrompt, extractSources, looksLikeOwnPrompt, parseRelayReply } from '../lib/ai/relay';
+import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
+import { useOnline } from '../lib/online';
 import { copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { hasCoords, spotRegion } from '../lib/geo';
 import { placeQuery, quickSearchLinks } from '../lib/maps';
@@ -11,6 +13,7 @@ import { useCurrentTrip, useStore } from '../store';
 import type { Category, Spot, Trip } from '../types';
 import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { useUI } from '../ui';
+import { MapAppLink } from './MapAppLink';
 import { Markdown } from './Markdown';
 import { Modal } from './Modal';
 import { PasteModal } from './PasteModal';
@@ -31,6 +34,9 @@ function SpotDetailInner({ trip, spot, onClose }: { trip: Trip; spot: Spot; onCl
   const ui = useUI();
   const region = spotRegion(spot, trip);
   const days = scheduledDays(trip, spot.id);
+  const locateStatus = useLocateStatus((s) => s.byKey[locateKey(trip.id, spot)]);
+  const online = useOnline();
+  const paused = useLocateStatus((s) => s.paused);
 
   return (
     <Modal
@@ -108,7 +114,19 @@ function SpotDetailInner({ trip, spot, onClose }: { trip: Trip; spot: Spot; onCl
         </label>
         <div className="row" style={{ marginBottom: 12 }}>
           <span className="small muted grow">
-            {hasCoords(spot) ? `座標 ${spot.lat.toFixed(5)}, ${spot.lng.toFixed(5)}` : '尚未定位（距離與路線估算需要座標）'}
+            {hasCoords(spot)
+              ? `座標 ${spot.lat.toFixed(5)}, ${spot.lng.toFixed(5)}${spot.geo === 'auto' ? '（自動定位，可能不準）' : ''}`
+              : inProgress(locateStatus, online, paused)
+                ? '自動定位中…'
+                : locateStatus === 'queued' || locateStatus === 'locating'
+                  ? online
+                    ? '暫時連不上地圖搜尋服務，稍後會再試（也可以按「定位」）'
+                    : '沒有網路，連線後會自動定位'
+                : locateStatus === 'not-found'
+                  ? '自動定位找不到這個地點，請按「定位」搜尋'
+                  : locateStatus === 'no-area'
+                    ? '尚未定位：請先設定旅程目的地，或手動定位一個地點'
+                    : '尚未定位（距離與路線估算需要座標）'}
           </span>
           <button className="btn btn-sm" onClick={() => ui.openAddSpot({ locateId: spot.id })}>
             📍 {hasCoords(spot) ? '修正位置' : '定位'}
@@ -285,11 +303,17 @@ function WebSearch({ spot, trip, region }: { spot: Spot; trip: Trip; region: 'cn
       <WikiResults spot={spot} destination={trip.destination} />
 
       <div className="row-wrap" style={{ marginTop: 10 }}>
-        {quickSearchLinks(spot, trip.destination, region).map((l) => (
-          <a key={l.label} className="chip" href={l.url} target="_blank" rel="noreferrer">
-            {l.label} ↗
-          </a>
-        ))}
+        {quickSearchLinks(spot, trip.destination, region).map((l) =>
+          l.app ? (
+            <MapAppLink key={l.label} className="chip" link={l.app}>
+              {l.label} ↗
+            </MapAppLink>
+          ) : (
+            <a key={l.label} className="chip" href={l.url} target="_blank" rel="noreferrer">
+              {l.label} ↗
+            </a>
+          ),
+        )}
       </div>
     </div>
   );

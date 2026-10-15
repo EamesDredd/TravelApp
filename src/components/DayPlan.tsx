@@ -84,6 +84,16 @@ function DayCard({ trip, index }: { trip: Trip; index: number }) {
             在後面插入一天
           </button>
           <button
+            className="btn btn-sm"
+            disabled={day.items.length === 0}
+            onClick={() => {
+              ui.openPdfExport({ day: index });
+              setMenu(false);
+            }}
+          >
+            📄 匯出這天 PDF
+          </button>
+          <button
             className="btn btn-sm btn-danger"
             disabled={trip.days.length <= 1}
             onClick={() => {

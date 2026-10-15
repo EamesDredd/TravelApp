@@ -1,10 +1,11 @@
 import { useMemo } from 'react';
 import { hasCoords, type ResolvedRegion } from '../lib/geo';
-import { amapPlaceUrl, googleEmbedPlaceUrl, googleSearchUrl } from '../lib/maps';
+import { amapPlaceLink, googleEmbedPlaceUrl, googleSearchLink } from '../lib/maps';
 import { useStore } from '../store';
 import type { Spot } from '../types';
 import { CATEGORY_ICON } from '../types';
 import { LeafletMap } from './LeafletMap';
+import { MapAppLink } from './MapAppLink';
 
 const CAT_COLOR = { sight: '#0f766e', breakfast: '#b45309', meal: '#be185d' } as const;
 
@@ -44,13 +45,13 @@ export function SpotMap({ spot, region, destination }: { spot: Spot; region: Res
       )}
       <div className="row-wrap" style={{ marginTop: 8 }}>
         {region === 'cn' ? (
-          <a className="btn btn-sm" href={amapPlaceUrl(spot, destination)} target="_blank" rel="noreferrer">
+          <MapAppLink className="btn btn-sm" link={amapPlaceLink(spot, destination)}>
             在高德地圖開啟
-          </a>
+          </MapAppLink>
         ) : null}
-        <a className="btn btn-sm" href={googleSearchUrl(spot, destination)} target="_blank" rel="noreferrer">
+        <MapAppLink className="btn btn-sm" link={googleSearchLink(spot, destination)}>
           在 Google 地圖開啟
-        </a>
+        </MapAppLink>
       </div>
     </div>
   );

@@ -13,6 +13,8 @@ interface UIState {
   pickSpotsForDay: number | null;
   /** Choose a day for this spot. */
   pickDayFor: string | null;
+  /** Export the itinerary as PDF; `day` preselects one day. */
+  pdfExport: { day?: number } | null;
   toast: string | null;
   openSpot(id: string | null): void;
   openRoute(day: number | null): void;
@@ -21,6 +23,7 @@ interface UIState {
   openAddSpot(v: UIState['addSpot']): void;
   openPickDay(spotId: string | null): void;
   openPickSpots(day: number | null): void;
+  openPdfExport(v: UIState['pdfExport']): void;
   showToast(msg: string): void;
 }
 
@@ -34,6 +37,7 @@ export const useUI = create<UIState>()((set) => ({
   addSpot: null,
   pickDayFor: null,
   pickSpotsForDay: null,
+  pdfExport: null,
   toast: null,
   openSpot: (spotId) => set({ spotId }),
   openRoute: (routeDay) => set({ routeDay }),
@@ -42,6 +46,7 @@ export const useUI = create<UIState>()((set) => ({
   openAddSpot: (addSpot) => set({ addSpot }),
   openPickDay: (pickDayFor) => set({ pickDayFor }),
   openPickSpots: (pickSpotsForDay) => set({ pickSpotsForDay }),
+  openPdfExport: (pdfExport) => set({ pdfExport }),
   showToast: (toast) => {
     clearTimeout(toastTimer);
     set({ toast });

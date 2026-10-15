@@ -57,8 +57,8 @@ export function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-export function downloadFile(filename: string, content: string, type: string) {
-  const blob = new Blob([content], { type });
+export function downloadFile(filename: string, content: string | Blob, type: string) {
+  const blob = typeof content === 'string' ? new Blob([content], { type }) : content;
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -66,7 +66,7 @@ export function downloadFile(filename: string, content: string, type: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 export function safeFilename(name: string): string {

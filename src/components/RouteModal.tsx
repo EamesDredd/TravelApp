@@ -1,19 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { amapCityCode, loadAmap, type AMapNS } from '../lib/amap';
+import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
+import { useOnline } from '../lib/online';
 import { distanceKm, estimateMinutes, formatKm, formatMinutes, hasCoords, stopsRegion, wgsToGcj } from '../lib/geo';
 import {
-  amapNavigationUrl,
+  amapNavigationLink,
+  amapSearchLink,
   chunkStops,
-  googleDirectionsUrl,
+  googleDirectionsLink,
   googleEmbedDirectionsUrl,
   tripToKml,
 } from '../lib/maps';
 import { downloadFile, formatDayDate, safeFilename } from '../lib/util';
-import { useCurrentTrip, useStore } from '../store';
+import { locator } from '../locator';
+import { getCurrentTrip, useCurrentTrip, useStore } from '../store';
 import type { Spot, TravelMode } from '../types';
 import { CATEGORY_ICON } from '../types';
 import { useUI } from '../ui';
 import { LeafletMap, type MapPoint } from './LeafletMap';
+import { MapAppLink } from './MapAppLink';
 import { Modal } from './Modal';
 
 const MODES: { id: TravelMode; label: string }[] = [
@@ -75,9 +80,29 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
   // walking takes no waypoints either, so those are shown one leg at a time.
   const perLeg = legs.length > 0 && (mode === 'transit' || (mode === 'walking' && region === 'cn'));
   const missing = stops.filter((s) => !hasCoords(s));
+  const statuses = useLocateStatus((s) => s.byKey);
+  const paused = useLocateStatus((s) => s.paused);
+  const online = useOnline();
+  const statusOf = (s: Spot) => statuses[locateKey(trip.id, s)];
+  const waiting = (s: Spot) => ['queued', 'locating'].includes(statusOf(s) ?? '');
+  const busy = (s: Spot) => inProgress(statusOf(s), online, paused);
+  const locating = missing.filter(busy);
+  // Offline: nothing can be searched, by hand either, so just say it will happen later.
+  const offline = online ? [] : missing.filter(waiting);
+  const unfound = missing.filter((s) => !busy(s) && !offline.includes(s));
+  const noArea = unfound.some((s) => statusOf(s) === 'no-area');
+  const retrying = online && paused && unfound.some(waiting);
+  const guessed = stops.filter((s) => hasCoords(s) && s.geo === 'auto');
+  const ui = useUI();
   const amapReady = region === 'cn' && !!settings.amapKey.trim();
   const close = () => useUI.getState().openRoute(null);
   const date = formatDayDate(trip.startDate, dayIdx);
+
+  // Look up places without coordinates as soon as the route is opened.
+  useEffect(() => {
+    const t = getCurrentTrip();
+    if (t) locator.schedule(t);
+  }, []);
 
   const exportKml = () => {
     const kml = tripToKml(trip, [dayIdx], (i) => `第${i + 1}天 ${formatDayDate(trip.startDate, i)}`.trim());
@@ -119,8 +144,50 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
           地圖上是直線連線。要在 App 內看實際路線與即時路況，請在設定填入高德 Key；或用下方按鈕直接開啟高德地圖導航。
         </p>
       )}
-      {missing.length > 0 && (
-        <p className="hint">⚠️ 尚未定位：{missing.map((s) => s.name).join('、')}（到地點詳情按「定位」）。</p>
+      {locating.length > 0 && (
+        <p className="hint">
+          <span className="spinner" /> 正在自動定位：{locating.map((s) => s.name).join('、')}…
+        </p>
+      )}
+      {offline.length > 0 && <p className="hint">📴 沒有網路，連線後會自動定位：{offline.map((s) => s.name).join('、')}</p>}
+      {unfound.length > 0 && (
+        <div className="notice" style={{ marginTop: 8 }}>
+          ⚠️ {noArea || retrying ? '還沒有座標，路線少了這些地點' : '找不到位置，路線少了這些地點'}：{unfound.map((s) => s.name).join('、')}
+          {retrying && (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              暫時連不上地圖搜尋服務，稍後會自動再試；也可以手動定位。
+            </div>
+          )}
+          {noArea && (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              App 還不知道這趟旅程在哪裡。到「我的旅程」填寫目的地，或先手動定位一個地點，其他地點就會自動定位。
+            </div>
+          )}
+          <div className="row-wrap" style={{ marginTop: 8 }}>
+            {unfound.map((s) => (
+              <button key={s.id} className="btn btn-sm" onClick={() => ui.openAddSpot({ locateId: s.id })}>
+                📍 定位「{s.name}」
+              </button>
+            ))}
+            <button className="btn btn-sm" onClick={() => locator.retry(trip, unfound.map((s) => s.id))}>
+              ↻ 重新搜尋
+            </button>
+          </div>
+        </div>
+      )}
+      {guessed.length > 0 && (
+        <p className="hint">
+          ℹ️ 自動定位：
+          {guessed.map((s, i) => (
+            <span key={s.id}>
+              {i > 0 && '、'}
+              <button className="linklike" onClick={() => ui.openSpot(s.id)}>
+                {s.name}
+              </button>
+            </span>
+          ))}
+          。位置不對的話，點名稱後按「修正位置」。
+        </p>
       )}
 
       <div className="section">
@@ -131,8 +198,12 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
         <ol className="legs">
           {legs.map(({ a, b, i }) => {
             const km = hasCoords(a) && hasCoords(b) ? distanceKm(a, b) : null;
+            const located = region !== 'cn' || km !== null;
+            // Amap needs coordinates for a route; without them, at least find the next place.
             const nav =
-              region === 'cn' ? amapNavigationUrl(a, b, mode) : googleDirectionsUrl([a, b], mode, trip.destination);
+              region === 'cn'
+                ? (amapNavigationLink(a, b, mode) ?? amapSearchLink(b, trip.destination))
+                : googleDirectionsLink([a, b], mode, trip.destination);
             return (
               <li
                 key={`${a.id}-${b.id}-${i}`}
@@ -145,20 +216,16 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
                     {CATEGORY_ICON[a.category]} {a.name} → {CATEGORY_ICON[b.category]} {b.name}
                   </b>
                   <div className="muted">
-                    {km !== null ? `${formatKm(km)} · 約 ${formatMinutes(estimateMinutes(km, mode))}` : '缺少座標'}
+                    {km !== null
+                      ? `${formatKm(km)} · 約 ${formatMinutes(estimateMinutes(km, mode))}`
+                      : busy(a) || busy(b)
+                        ? '定位中…'
+                        : '缺少座標'}
                   </div>
                 </span>
-                {nav ? (
-                  <a
-                    className="btn btn-sm"
-                    href={nav}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    導航
-                  </a>
-                ) : null}
+                <MapAppLink className="btn btn-sm" link={nav} onClick={(e) => e.stopPropagation()}>
+                  {located ? '導航' : '搜尋'}
+                </MapAppLink>
               </li>
             );
           })}
@@ -174,15 +241,9 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
               <span className="hint">Google 地圖的大眾運輸不支援多個中途點，請用上方各段的「導航」。</span>
             ) : (
               chunkStops(stops).map((chunk, i, all) => (
-                <a
-                  key={i}
-                  className="btn btn-primary"
-                  href={googleDirectionsUrl(chunk, mode, trip.destination)}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <MapAppLink key={i} className="btn btn-primary" link={googleDirectionsLink(chunk, mode, trip.destination)}>
                   Google 地圖{all.length > 1 ? ` (${i + 1}/${all.length})` : ''}：{chunk[0].name} → {chunk[chunk.length - 1].name}
-                </a>
+                </MapAppLink>
               ))
             )
           ) : mode === 'driving' && stops.length >= 2 && stops.length <= 3 ? (
@@ -212,12 +273,12 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
 }
 
 function AmapLink({ stops }: { stops: Spot[] }) {
-  const url = amapNavigationUrl(stops[0], stops[stops.length - 1], 'driving', stops.length === 3 ? stops[1] : undefined);
-  if (!url) return <span className="hint">需要先定位所有地點。</span>;
+  const link = amapNavigationLink(stops[0], stops[stops.length - 1], 'driving', stops.length === 3 ? stops[1] : undefined);
+  if (!link) return <span className="hint">需要先定位所有地點。</span>;
   return (
-    <a className="btn btn-primary" href={url} target="_blank" rel="noreferrer">
+    <MapAppLink className="btn btn-primary" link={link}>
       在高德地圖開啟整天路線
-    </a>
+    </MapAppLink>
   );
 }
 

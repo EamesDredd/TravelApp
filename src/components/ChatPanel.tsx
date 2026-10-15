@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { aiConfigured, chatSupportsWebSearch, FriendlyError, providerLabel, runChatTurn } from '../lib/ai';
-import { buildFixPrompt, buildRelayPrompt, newRelayTag, planRelayApply, tripFingerprint } from '../lib/ai/relay';
+import { buildFixPrompt, buildRelayPrompt, contentFingerprint, newRelayTag, planRelayApply, tripFingerprint } from '../lib/ai/relay';
 import { AI_APP_LINKS, copyText, preview, readClipboard, sendToAiApp } from '../lib/handoff';
 import { snapshotOf } from '../lib/tripOps';
 import { uid } from '../lib/util';
@@ -301,7 +301,7 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
           if (!partial) result = d.before;
         }
         const resultFp = tripFingerprint(result);
-        const changed = resultFp !== tripFingerprint(d.before);
+        const changed = contentFingerprint(result) !== contentFingerprint(d.before);
         if (!changed) replaced = false;
         if (changed) {
           replaceSnapshot(result);
@@ -374,7 +374,7 @@ function ChatBody(props: { visible: boolean; running: boolean; setRunning(v: boo
     const restored = m.undo;
     // Replies that replace each other share one starting point; only the one in effect holds it.
     const start = t.chat.slice(idx).find((x) => x.relayBase === m.relayBase && x.relayStart && !x.undone)?.relayStart;
-    replaceSnapshot(restored);
+    replaceSnapshot(restored, { restore: true });
     for (const x of [m, ...later]) updateChat(x.id, { undo: undefined, relayStart: undefined, undone: true });
     // A reply this one had replaced is in effect again, and takes back the request's starting point.
     if (m.relayBase) {

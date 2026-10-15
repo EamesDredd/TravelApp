@@ -3,14 +3,17 @@ import { AddSpotModal } from './components/AddSpotModal';
 import { CandidatePool } from './components/CandidatePool';
 import { ChatPanel } from './components/ChatPanel';
 import { DayPlan } from './components/DayPlan';
+import { ExportPdfModal } from './components/ExportPdfModal';
 import { DayPickerModal, SpotPickerModal } from './components/Pickers';
 import { RouteModal } from './components/RouteModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SpotDetail } from './components/SpotDetail';
 import { TripForm, TripsModal } from './components/TripsModal';
+import { hasCoords } from './lib/geo';
 import { parseTrip, sharedTripInHash } from './lib/share';
 import { formatDayDate } from './lib/util';
-import { useCurrentTrip, useStore } from './store';
+import { locator } from './locator';
+import { getCurrentTrip, useCurrentTrip, useStore } from './store';
 import { useUI } from './ui';
 
 export default function App() {
@@ -18,6 +21,7 @@ export default function App() {
   const view = useStore((s) => s.view);
   const chatOpen = useStore((s) => s.chatOpen);
   const toast = useUI((s) => s.toast);
+  useAutoLocate();
 
   // Import a trip opened from a share link (#trip=...).
   useEffect(() => {
@@ -57,16 +61,38 @@ export default function App() {
       ) : (
         <Welcome />
       )}
+      {/* The route map opens place details and the locate dialog on top of itself. */}
+      <RouteModal />
       <SpotDetail />
       <AddSpotModal />
       <DayPickerModal />
       <SpotPickerModal />
-      <RouteModal />
       <TripsModal />
+      <ExportPdfModal />
       <SettingsModal />
       {toast && <div className="toast">{toast}</div>}
     </>
   );
+}
+
+/** Finds coordinates in the background for places of the open trip that have none. */
+function useAutoLocate() {
+  const trip = useCurrentTrip();
+  const unlocated = trip
+    ? trip.spots
+        .filter((s) => !hasCoords(s))
+        .map((s) => `${s.id}:${s.name}`)
+        .join('|')
+    : '';
+  useEffect(() => {
+    const t = getCurrentTrip();
+    if (t && unlocated) locator.schedule(t);
+  }, [trip?.id, unlocated, trip?.destination, !!trip?.center]);
+  useEffect(() => {
+    const resume = () => locator.resume();
+    window.addEventListener('online', resume);
+    return () => window.removeEventListener('online', resume);
+  }, []);
 }
 
 function Welcome() {
@@ -108,6 +134,9 @@ function TopBar() {
       <button className="trip-btn" onClick={() => ui.openTrips(true)}>
         <span className="trip-name">{trip.name} ▾</span>
         <span className="trip-sub">{sub}</span>
+      </button>
+      <button className="icon-btn" aria-label="匯出 PDF" title="匯出 PDF 行程表" onClick={() => ui.openPdfExport({})}>
+        📄
       </button>
       <button className="icon-btn" aria-label="設定" onClick={() => ui.openSettings(true)}>
         ⚙

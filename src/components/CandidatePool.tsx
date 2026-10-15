@@ -1,5 +1,7 @@
 import { useState } from 'react';
+import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
 import { hasCoords } from '../lib/geo';
+import { useOnline } from '../lib/online';
 import { CATEGORIES, scheduledDays } from '../lib/tripOps';
 import { useCurrentTrip } from '../store';
 import type { Category } from '../types';
@@ -12,6 +14,10 @@ export function CandidatePool() {
   const [cat, setCat] = useState<Category | 'all'>('all');
   const [onlyFree, setOnlyFree] = useState(false);
   const [q, setQ] = useState('');
+  const statuses = useLocateStatus((s) => s.byKey);
+  const paused = useLocateStatus((s) => s.paused);
+  const online = useOnline();
+  const locating = (id: string, name: string) => inProgress(statuses[locateKey(trip.id, { id, name })], online, paused);
 
   const count = (c: Category) => trip.spots.filter((s) => s.category === c).length;
   const list = trip.spots
@@ -62,7 +68,7 @@ export function CandidatePool() {
                 <span className="item-text">
                   <span className="item-name">{s.name}</span>
                   <span className="item-sub">
-                    {s.address || s.note || (hasCoords(s) ? '已定位' : '未定位')}
+                    {s.address || s.note || (hasCoords(s) ? '已定位' : locating(s.id, s.name) ? '定位中…' : '未定位')}
                   </span>
                   <span className="cand-badges">
                     {days.length ? (
