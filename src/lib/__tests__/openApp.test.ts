@@ -63,7 +63,12 @@ describe('app links', () => {
     expect(amapPlaceLink(yu, '上海').ios).toMatch(/^iosamap:\/\/viewMap\?sourceApplication=travel-planner&poiname=/);
     expect(amapPlaceLink(yu, '上海').android).toMatch(/^intent:\/\/viewMap\?.*#Intent;scheme=androidamap;/);
     expect(amapPlaceLink(noCoords, '上海')).toEqual(amapSearchLink(noCoords, '上海'));
-    expect(amapSearchLink(noCoords, '上海').ios).toBe(`iosamap://poi?sourceApplication=travel-planner&name=${encodeURIComponent('小楊生煎')}&dev=0`);
+    // The app searches where the phone is: the trip's city goes in front of the name.
+    expect(amapSearchLink(noCoords, '上海').ios).toBe(`iosamap://poi?sourceApplication=travel-planner&name=${encodeURIComponent('上海 小楊生煎')}&dev=0`);
+    expect(amapSearchLink({ ...noCoords, name: '上海小楊生煎' }, '上海').ios).toContain(`name=${encodeURIComponent('上海小楊生煎')}&`);
+    // Spaces as %20, never '+', in app URLs.
+    expect(amapNavigationLink({ ...bund, name: 'Shake Shack' }, pvg, 'walking')!.ios).toContain('sname=Shake%20Shack');
+    expect(amapPlaceLink({ ...yu, name: 'M Stand' }).android).toContain('poiname=M%20Stand');
     expect(amapSearchLink(noCoords, '上海').android).toContain('intent://poi?sourceApplication=travel-planner&keywords=');
   });
 });
@@ -76,6 +81,8 @@ describe('opening', () => {
     expect(detectPlatform('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 5)).toBe('ios'); // iPad
     expect(detectPlatform('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 0)).toBe('other');
     expect(detectPlatform('Mozilla/5.0 (Linux; Android 15; Pixel 9)', 5)).toBe('android');
+    // LINE / Facebook in-app browser (a WebView): plain web links.
+    expect(detectPlatform('Mozilla/5.0 (Linux; Android 14; SM-S918B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/129.0 Mobile Safari/537.36 Line/14.16.0', 5)).toBe('other');
     expect(detectPlatform('Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 0)).toBe('other');
   });
 

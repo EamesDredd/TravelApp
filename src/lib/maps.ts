@@ -181,17 +181,25 @@ export function googleDirectionsLink(stops: Spot[], mode: TravelMode, destinatio
   return googleApp(googleDirectionsUrl(stops, mode, destination), `comgooglemaps://?${params.join('&')}`);
 }
 
+/** Query string with spaces as %20: app URL parsers (iOS) do not read '+' as a space. */
+const qs = (p: URLSearchParams) => p.toString().replace(/\+/g, '%20');
+
 function amapApp(web: string, ios: string, android: string): AppLink {
   return { app: 'amap', web, ios, android: intentUrl(android, AMAP_PACKAGE, web) };
 }
 
 const AMAP_APP_MODE: Record<TravelMode, string> = { driving: '0', transit: '1', walking: '2' };
 
-/** Search by name in the Amap app. */
+/**
+ * Search by name in the Amap app. The app's search has no city parameter (it searches where
+ * the phone is), so the trip's city goes in front of the name, as Amap understands.
+ */
 export function amapSearchLink(spot: Spot, destination?: string): AppLink {
-  const ios = new URLSearchParams({ sourceApplication: SRC, name: spot.name, dev: '0' });
-  const android = new URLSearchParams({ sourceApplication: SRC, keywords: spot.name, dev: '0' });
-  return amapApp(amapSearchUrl(spot, destination), `iosamap://poi?${ios}`, `androidamap://poi?${android}`);
+  const city = destination?.trim();
+  const keyword = city && !spot.name.includes(city) ? `${city} ${spot.name}` : spot.name;
+  const ios = new URLSearchParams({ sourceApplication: SRC, name: keyword, dev: '0' });
+  const android = new URLSearchParams({ sourceApplication: SRC, keywords: keyword, dev: '0' });
+  return amapApp(amapSearchUrl(spot, destination), `iosamap://poi?${qs(ios)}`, `androidamap://poi?${qs(android)}`);
 }
 
 /** The place on the Amap app's map, or a search when it has no coordinates. */
@@ -205,7 +213,7 @@ export function amapPlaceLink(spot: Spot, destination?: string): AppLink {
     lon: g.lng.toFixed(6),
     dev: '0', // already GCJ-02
   });
-  return amapApp(amapPlaceUrl(spot, destination), `iosamap://viewMap?${params}`, `androidamap://viewMap?${params}`);
+  return amapApp(amapPlaceUrl(spot, destination), `iosamap://viewMap?${qs(params)}`, `androidamap://viewMap?${qs(params)}`);
 }
 
 /** Route in the Amap app; null without coordinates. A stop on the way is left to the web page. */
@@ -226,7 +234,7 @@ export function amapNavigationLink(from: Spot, to: Spot, mode: TravelMode, via?:
     dev: '0',
     t: AMAP_APP_MODE[mode],
   });
-  return amapApp(web, `iosamap://path?${params}`, `amapuri://route/plan/?${params}`);
+  return amapApp(web, `iosamap://path?${qs(params)}`, `amapuri://route/plan/?${qs(params)}`);
 }
 
 // ---------------------------------------------------------------- KML (Google 我的地圖)
