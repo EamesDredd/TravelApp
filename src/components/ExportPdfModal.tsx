@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { locateKey, useLocateStatus } from '../lib/autoLocate';
+import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
 import { hasCoords } from '../lib/geo';
 import { useOnline } from '../lib/online';
 import { buildItinerary } from '../lib/pdf/itinerary';
@@ -39,6 +39,7 @@ function ExportPdfInner({ initialDay }: { initialDay?: number }) {
   const [result, setResult] = useState<Result | null>(null);
   const ctrl = useRef<AbortController | null>(null);
   const statuses = useLocateStatus((s) => s.byKey);
+  const paused = useLocateStatus((s) => s.paused);
 
   // The chosen day may disappear while the dialog is open (the AI shortened the trip).
   const day = range >= 0 && range < trip.days.length ? range : -1;
@@ -49,7 +50,7 @@ function ExportPdfInner({ initialDay }: { initialDay?: number }) {
     .filter((s) => !!s);
   const unlocated = stops.filter((s) => !hasCoords(s));
   const waiting = unlocated.filter((s) => ['queued', 'locating'].includes(statuses[locateKey(trip.id, s)] ?? ''));
-  const locating = online ? waiting : [];
+  const locating = unlocated.filter((s) => inProgress(statuses[locateKey(trip.id, s)], online, paused));
   const missing = unlocated.filter((s) => !locating.includes(s));
   const empty = stops.length === 0;
 
@@ -175,7 +176,7 @@ function ExportPdfInner({ initialDay }: { initialDay?: number }) {
       {maps && missing.length > 0 && (
         <p className="hint">
           ⚠️ {missing.length} 個地點沒有座標，不會出現在地圖上：{missing.map((s) => s.name).join('、')}
-          {!online && waiting.length > 0 && '（沒有網路，連線後會自動定位）'}
+          {waiting.length > locating.length && (online ? '（暫時連不上地圖搜尋服務，稍後會再試）' : '（沒有網路，連線後會自動定位）')}
         </p>
       )}
 

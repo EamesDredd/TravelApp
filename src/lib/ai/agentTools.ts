@@ -425,6 +425,11 @@ function updateSpots(trip: TripSnapshot, input: Obj): ApplyResult {
       // it was shown.
       const same = hasCoords(spot) && Math.abs(spot.lat - lat) < 1e-4 && Math.abs(spot.lng - lng) < 1e-4;
       if (!same) patch.geo = undefined;
+      else if (patch.name !== undefined && normName(patch.name) !== normName(spot.name)) {
+        // Renamed, with the coordinates it was shown: those were found for the old name.
+        delete patch.lat;
+        delete patch.lng;
+      }
     } else if (lat !== undefined || lng !== undefined) {
       errors.push(`${id} 的座標要同時提供 lat 和 lng`);
     }

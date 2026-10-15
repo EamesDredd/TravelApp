@@ -1,9 +1,9 @@
 /* Background locating of places that have no coordinates (added by the AI without them,
  * typed in by hand, imported…), so distances and route maps cover every stop. */
 import { create } from 'zustand';
-import { hasCoords, tripRegion, type ResolvedRegion } from './geo';
+import { distanceKm, hasCoords, tripRegion, type ResolvedRegion } from './geo';
 import { searchAmap, searchOsm, type PlaceResult } from './geocode';
-import { centroid, isGenericName, normName, pickPlaceDetailed, queryVariants } from './placeMatch';
+import { centroid, isGenericName, MAX_KM_PARTIAL, normName, pickPlaceDetailed, queryVariants } from './placeMatch';
 import type { LatLng, Settings, Spot, Trip } from '../types';
 
 /**
@@ -13,7 +13,15 @@ import type { LatLng, Settings, Spot, Trip } from '../types';
  */
 export type LocateStatus = 'queued' | 'locating' | 'found' | 'not-found' | 'skipped' | 'no-area';
 
-export const useLocateStatus = create<{ byKey: Record<string, LocateStatus> }>(() => ({ byKey: {} }));
+export const useLocateStatus = create<{
+  byKey: Record<string, LocateStatus>;
+  /** The map search service failed; queued places wait for a retry instead of being searched now. */
+  paused: boolean;
+}>(() => ({ byKey: {}, paused: false }));
+
+/** Whether a status means the place is being (or about to be) searched right now. */
+export const inProgress = (st: LocateStatus | undefined, online: boolean, paused: boolean) =>
+  online && !paused && (st === 'queued' || st === 'locating');
 
 /** A spot is looked up again when it is renamed. */
 export const locateKey = (tripId: string, spot: Pick<Spot, 'id' | 'name'>) => `${tripId}|${spot.id}|${normName(spot.name)}`;
@@ -84,6 +92,12 @@ export async function findPlace(
     // Outside the box around the trip: a day trip further out, or the trip's second city.
     const hit = pick(await s.osm(variants[0], {}), variants[0], EXACT_KM);
     if (hit) return { place: hit, far: false };
+  }
+  // A small place missing from the map under its name: its street address, if near the trip.
+  const address = spot.address?.trim();
+  if (address && normName(address).length >= 4 && normName(address) !== normName(ctx.destination)) {
+    const [r] = await s.osm(address, { near: ctx.center, bounded: !!ctx.center, limit: 1 });
+    if (r && ctx.anchors.some((a) => distanceKm(a, r) <= MAX_KM_PARTIAL)) return { place: r, far: false };
   }
   return { place: null, far };
 }
@@ -188,6 +202,9 @@ export function createLocator(deps: LocatorDeps): Locator {
       return { byKey };
     });
   const getStatus = (key: string) => useLocateStatus.getState().byKey[key];
+  const setPaused = (paused: boolean) => {
+    if (useLocateStatus.getState().paused !== paused) useLocateStatus.setState({ paused });
+  };
 
   const hasArea = (trip: Trip) => !!trip.center || trip.spots.some(hasCoords);
 
@@ -238,6 +255,7 @@ export function createLocator(deps: LocatorDeps): Locator {
         const { place, far } = await deps.find(spot, contextFor(trip, deps.getSettings()));
         queue.shift();
         failures = 0;
+        setPaused(false);
         if (!place) {
           if (!far) deps.misses.add(job.key);
           setStatus(job.key, 'not-found');
@@ -259,9 +277,11 @@ export function createLocator(deps: LocatorDeps): Locator {
         failures++;
         const delay = Math.min((deps.retryDelayMs ?? 60_000) * 2 ** (failures - 1), 15 * 60_000);
         pausedUntil = Date.now() + delay;
+        setPaused(true);
         clearTimeout(timer);
         timer = setTimeout(() => {
           pausedUntil = 0;
+          setPaused(false);
           kick();
         }, delay);
         return;
@@ -284,7 +304,8 @@ export function createLocator(deps: LocatorDeps): Locator {
       if (hasCoords(spot)) continue;
       const key = locateKey(trip.id, spot);
       const st = getStatus(key);
-      if (st && !(st === 'no-area' && hasArea(trip))) continue;
+      // A trip that now has a destination (or a located place) gets its waiting places searched.
+      if (st && !(st === 'no-area' && (hasArea(trip) || trip.destination.trim()))) continue;
       if (isGenericName(spot.name)) {
         setStatus(key, 'skipped');
         continue;
@@ -317,11 +338,13 @@ export function createLocator(deps: LocatorDeps): Locator {
         }
       }
       pausedUntil = 0;
+      setPaused(false);
       schedule(trip);
       void kick();
     },
     resume() {
       pausedUntil = 0;
+      setPaused(false);
       void kick();
     },
     idle: async () => {

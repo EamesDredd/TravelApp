@@ -220,7 +220,7 @@ function harness(trip: Trip, find: SimpleFind, opts: Partial<LocatorDeps> = {}) 
 }
 
 describe('background locator', () => {
-  beforeEach(() => useLocateStatus.setState({ byKey: {} }));
+  beforeEach(() => useLocateStatus.setState({ byKey: {}, paused: false }));
 
   it('locates places without coordinates and leaves the others alone', async () => {
     const seen: string[] = [];
@@ -473,7 +473,7 @@ describe('matching, after review', () => {
 });
 
 describe('locator, after review', () => {
-  beforeEach(() => useLocateStatus.setState({ byKey: {} }));
+  beforeEach(() => useLocateStatus.setState({ byKey: {}, paused: false }));
 
   it('does not search anywhere in the world when the trip has no area', async () => {
     let calls = 0;
@@ -606,5 +606,84 @@ describe('relay fingerprints, after review', () => {
     if (d2.kind !== 'apply') throw new Error(d2.kind);
     expect(d2.replaces).toBe('a1');
     expect(d2.dropped).toEqual(['「清水寺」先前改過的資料會還原']);
+  });
+});
+
+describe('second review round', () => {
+  beforeEach(() => useLocateStatus.setState({ byKey: {}, paused: false }));
+  const TOKYO = { lat: 35.6896, lng: 139.7006 };
+
+  it('more Japanese forms', () => {
+    expect(nameScore('神戶', ['神戸'])).toBe(1);
+    expect(nameScore('姬路城', ['姫路城'])).toBe(1);
+    expect(nameScore('嚴島神社', ['厳島神社'])).toBe(1);
+  });
+
+  it('a part of the name must be the whole name of the place, and not too short', () => {
+    const TAIPEI = { lat: 25.034, lng: 121.5645 };
+    expect(pickPlace([place('象山觀景台', 25.027, 121.576)], '台北101 觀景台', '觀景台', [TAIPEI])).toBeNull();
+    const KYOTO = { lat: 35.0116, lng: 135.7681 };
+    expect(pickPlace([place('竹林寺', 35.02, 135.68)], '京都 嵐山 竹林', '竹林', [KYOTO])).toBeNull();
+    const station = place('龙阳路', 31.203, 121.557, { kind: 'railway:station' });
+    expect(pickPlace([station], '磁浮列車 龍陽路站', '龍陽路', [SHANGHAI])).toBe(station);
+  });
+
+  it('a note in brackets does not make a day trip a partial match', () => {
+    const lake = place('河口湖', 35.5167, 138.75);
+    expect(pickPlace([lake], '河口湖（富士山一日遊）', '河口湖', [TOKYO])).toBe(lake);
+  });
+
+  it('tries the address when the name finds nothing nearby', async () => {
+    const osm = async (q: string) => (q.includes('道頓堀') ? [place('道頓堀1丁目', 34.6687, 135.5013)] : []);
+    const OSAKA = { lat: 34.69, lng: 135.5 };
+    const r = await findPlace(
+      { name: '某家小店', address: '大阪市中央區道頓堀1-6-4' },
+      { region: 'intl', destination: '大阪', anchors: [OSAKA], center: OSAKA },
+      { osm, amap: async () => [] },
+    );
+    expect(r.place?.lat).toBe(34.6687);
+  });
+
+  it('setting a destination later gets waiting places searched', async () => {
+    let calls = 0;
+    const h = harness(
+      mkTrip([spot('a', '豫園')], { destination: '' }),
+      async () => {
+        calls++;
+        return place('豫园', 31.227, 121.492);
+      },
+      { findCenter: async (d) => (d === '上海' ? SHANGHAI : null) },
+    );
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(h.status('a')).toBe('no-area');
+    h.trip = { ...h.trip, destination: '上海' };
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(calls).toBe(1);
+    expect(h.status('a')).toBe('found');
+  });
+
+  it('tells the UI while the service is failing', async () => {
+    let fail = true;
+    const h = harness(mkTrip([spot('a', '豫園')]), async () => {
+      if (fail) throw new Error('429');
+      return place('豫园', 31.227, 121.492);
+    });
+    h.locator.schedule(h.trip);
+    await h.locator.idle();
+    expect(useLocateStatus.getState().paused).toBe(true);
+    fail = false;
+    await new Promise((r) => setTimeout(r, 30));
+    await h.locator.idle();
+    expect(useLocateStatus.getState().paused).toBe(false);
+    expect(h.status('a')).toBe('found');
+  });
+
+  it('an AI rename that repeats the guessed coordinates still locates the new name', () => {
+    const t = snap([{ ...spot('a', '一蘭拉麵', { lat: 34.70274, lng: 135.49915 }), geo: 'auto' }]);
+    const r = applyToolCall(t, 'update_spots', { updates: [{ spot_id: 'a', name: '一蘭拉麵 道頓堀店', lat: 34.70274, lng: 135.49915 }] });
+    expect(r.trip.spots[0].name).toBe('一蘭拉麵 道頓堀店');
+    expect(r.trip.spots[0].lat).toBeUndefined();
   });
 });

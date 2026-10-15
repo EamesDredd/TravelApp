@@ -14,7 +14,7 @@ const SHINJITAI =
   '釈释収收従从獣兽縦纵粛肃処处焼烧証证乗乘浄净剰剩畳叠縄绳壌壤譲让醸酿粋粹酔醉穂穗髄髓瀬濑斉齐摂摄専专戦战' +
   '銭钱繊纤荘庄捜搜挿插巣巢層层総总騒骚増增蔵藏贈赠臓脏続续対对帯带滝泷択择単单嘆叹団团弾弹遅迟鋳铸庁厅徴征' +
   '聴听鎮镇転转伝传闘斗徳德読读弐贰悩恼脳脑廃废拝拜売卖発发髪发抜拔晩晚賓宾頻频払拂仏佛併并変变舗铺豊丰毎每' +
-  '満满黙默訳译揺摇様样謡谣頼赖覧览両两猟猎緑绿塁垒涙泪霊灵齢龄暦历歴历労劳録录郷乡隣邻鴎鸥亀龟';
+  '満满黙默訳译揺摇様样謡谣頼赖覧览両两猟猎緑绿塁垒涙泪霊灵齢龄暦历歴历労劳録录郷乡隣邻鴎鸥亀龟戸户姫姬厳严渓溪隠隐';
 let shinjitai: Map<string, string> | null = null;
 
 /** Comparable form of a name: simplified Chinese, NFKC, lower case, no spaces, punctuation or symbols. */
@@ -213,14 +213,21 @@ export function pickPlaceDetailed<T extends Candidate>(
   let best: { r: T; score: number } | null = null;
   let far = false;
   const addr = opts.address ? normName(opts.address) : '';
+  // "河口湖（富士山一日遊）": the name without its note is still the whole place.
+  const bare = spotName.replace(/[(（【[「『][^)）】\]」』]*[)）】\]」』]/g, ' ').trim();
+  const bareOk = normName(bare) !== normName(spotName) && !isGenericName(bare);
   for (const r of results) {
     if (!Number.isFinite(r.lat) || !Number.isFinite(r.lng)) continue;
     const names = [r.name, ...(r.names ?? [])];
     const full = nameScore(spotName, names);
     const part = nameScore(query, names);
     if (Math.max(full, part) < MIN_NAME_SCORE) continue;
+    const whole = full >= MIN_NAME_SCORE || (bareOk && nameScore(bare, names) >= MIN_NAME_SCORE);
+    // Found only through part of the name ("龍陽路站" for "磁浮列車 龍陽路站"): that part must be
+    // the place's whole name and not too short to mean much on its own ("竹林", "觀景台").
+    if (!whole && (part < 1 || [...normName(query)].length < 3)) continue;
     const km = anchors.length ? Math.min(...anchors.map((a) => distanceKm(a, r))) : 0;
-    const limit = full >= MIN_NAME_SCORE ? (full === 1 ? Math.max(opts.exactKm ?? 0, MAX_KM_FROM_TRIP) : MAX_KM_FROM_TRIP) : MAX_KM_PARTIAL;
+    const limit = full === 1 ? Math.max(opts.exactKm ?? 0, MAX_KM_FROM_TRIP) : whole ? MAX_KM_FROM_TRIP : MAX_KM_PARTIAL;
     if (km > limit) {
       far = true;
       continue;

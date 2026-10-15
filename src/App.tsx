@@ -87,7 +87,7 @@ function useAutoLocate() {
   useEffect(() => {
     const t = getCurrentTrip();
     if (t && unlocated) locator.schedule(t);
-  }, [trip?.id, unlocated]);
+  }, [trip?.id, unlocated, trip?.destination, !!trip?.center]);
   useEffect(() => {
     const resume = () => locator.resume();
     window.addEventListener('online', resume);

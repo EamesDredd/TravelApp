@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { amapCityCode, loadAmap, type AMapNS } from '../lib/amap';
-import { locateKey, useLocateStatus } from '../lib/autoLocate';
+import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
 import { useOnline } from '../lib/online';
 import { distanceKm, estimateMinutes, formatKm, formatMinutes, hasCoords, stopsRegion, wgsToGcj } from '../lib/geo';
 import {
@@ -80,14 +80,17 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
   const perLeg = legs.length > 0 && (mode === 'transit' || (mode === 'walking' && region === 'cn'));
   const missing = stops.filter((s) => !hasCoords(s));
   const statuses = useLocateStatus((s) => s.byKey);
+  const paused = useLocateStatus((s) => s.paused);
   const online = useOnline();
   const statusOf = (s: Spot) => statuses[locateKey(trip.id, s)];
   const waiting = (s: Spot) => ['queued', 'locating'].includes(statusOf(s) ?? '');
-  const busy = (s: Spot) => online && waiting(s);
+  const busy = (s: Spot) => inProgress(statusOf(s), online, paused);
   const locating = missing.filter(busy);
+  // Offline: nothing can be searched, by hand either, so just say it will happen later.
   const offline = online ? [] : missing.filter(waiting);
-  const unfound = missing.filter((s) => !waiting(s));
+  const unfound = missing.filter((s) => !busy(s) && !offline.includes(s));
   const noArea = unfound.some((s) => statusOf(s) === 'no-area');
+  const retrying = online && paused && unfound.some(waiting);
   const guessed = stops.filter((s) => hasCoords(s) && s.geo === 'auto');
   const ui = useUI();
   const amapReady = region === 'cn' && !!settings.amapKey.trim();
@@ -148,7 +151,12 @@ function RouteInner({ dayIdx }: { dayIdx: number }) {
       {offline.length > 0 && <p className="hint">📴 沒有網路，連線後會自動定位：{offline.map((s) => s.name).join('、')}</p>}
       {unfound.length > 0 && (
         <div className="notice" style={{ marginTop: 8 }}>
-          ⚠️ {noArea ? '還沒有座標，路線少了這些地點' : '找不到位置，路線少了這些地點'}：{unfound.map((s) => s.name).join('、')}
+          ⚠️ {noArea || retrying ? '還沒有座標，路線少了這些地點' : '找不到位置，路線少了這些地點'}：{unfound.map((s) => s.name).join('、')}
+          {retrying && (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              暫時連不上地圖搜尋服務，稍後會自動再試；也可以手動定位。
+            </div>
+          )}
           {noArea && (
             <div className="small muted" style={{ marginTop: 4 }}>
               App 還不知道這趟旅程在哪裡。到「我的旅程」填寫目的地，或先手動定位一個地點，其他地點就會自動定位。
