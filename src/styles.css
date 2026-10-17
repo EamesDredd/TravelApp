@@ -865,6 +865,25 @@ button.chip {
   display: block;
 }
 
+.amap-tools {
+  margin-bottom: 8px;
+}
+
+.picked-line {
+  margin: 4px 0 6px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pickmap {
+  height: 260px;
+  cursor: crosshair;
+}
+
+.pin-pick span {
+  box-shadow: 0 0 0 5px rgb(220 38 38 / 25%);
+}
+
 .map-placeholder {
   height: 160px;
   border-radius: 12px;

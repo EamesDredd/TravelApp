@@ -12,7 +12,7 @@ export interface MapPoint {
   color?: string;
 }
 
-const TILES: Record<ResolvedRegion, { url: string; attribution: string; subdomains?: string }> = {
+export const TILES: Record<ResolvedRegion, { url: string; attribution: string; subdomains?: string }> = {
   // Amap tiles are drawn in GCJ-02, so markers are converted before placing.
   cn: {
     url: 'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
@@ -24,6 +24,15 @@ const TILES: Record<ResolvedRegion, { url: string; attribution: string; subdomai
     attribution: '© OpenStreetMap',
   },
 };
+
+/** A round pin showing `label` (a number or an icon). */
+export function pinIcon(label: string, color = '#0f766e', size = 26, className = 'pin'): L.DivIcon {
+  const html = document.createElement('span');
+  html.textContent = label;
+  html.style.background = color;
+  if (size !== 26) Object.assign(html.style, { width: `${size}px`, height: `${size}px`, fontSize: `${Math.round(size / 2)}px` });
+  return L.divIcon({ className, html, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
+}
 
 /** Leaflet map with numbered pins and an optional line joining them in order. */
 export function LeafletMap(props: { points: MapPoint[]; region: ResolvedRegion; line?: boolean; className?: string }) {
@@ -64,13 +73,9 @@ export function LeafletMap(props: { points: MapPoint[]; region: ResolvedRegion; 
       ).addTo(g);
     }
     for (const p of pts) {
-      const html = document.createElement('span');
-      html.textContent = p.label;
-      html.style.background = p.color ?? '#0f766e';
-      const icon = L.divIcon({ className: 'pin', html, iconSize: [26, 26], iconAnchor: [13, 13] });
       const tip = document.createElement('span');
       tip.textContent = p.title;
-      L.marker(p.ll, { icon, title: p.title }).bindTooltip(tip).addTo(g);
+      L.marker(p.ll, { icon: pinIcon(p.label, p.color), title: p.title }).bindTooltip(tip).addTo(g);
     }
     if (pts.length === 1) m.setView(pts[0].ll, 15);
     else if (pts.length > 1) m.fitBounds(L.latLngBounds(pts.map((p) => p.ll)), { padding: [28, 28], maxZoom: 16 });

@@ -2,6 +2,16 @@ import { create } from 'zustand';
 import type { IncomingTrip } from './lib/share';
 import type { Category } from './types';
 
+export interface AddSpotOpts {
+  day?: number;
+  category?: Category;
+  locateId?: string;
+  /** Name typed so far (when the dialog comes back after looking the place up in the Amap app). */
+  name?: string;
+  /** Reopened after coming back from the Amap app. */
+  restored?: boolean;
+}
+
 interface UIState {
   spotId: string | null;
   routeDay: number | null;
@@ -9,7 +19,7 @@ interface UIState {
   tripsOpen: boolean;
   /** Open the add-place dialog; `day` also schedules the new place on that day,
    * `locateId` sets the position of an existing place instead. */
-  addSpot: { day?: number; category?: Category; locateId?: string } | null;
+  addSpot: AddSpotOpts | null;
   /** Pick candidates to add to this day. */
   pickSpotsForDay: number | null;
   /** Choose a day for this spot. */
