@@ -219,6 +219,35 @@ label.field > span {
   font-size: 13px;
 }
 
+.warn {
+  color: var(--danger);
+}
+
+.choice {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.choice:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.choice > div > * + * {
+  margin-top: 2px;
+}
+
 .seg {
   display: flex;
   background: var(--surface-2);

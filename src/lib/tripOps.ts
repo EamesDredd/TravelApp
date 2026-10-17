@@ -1,6 +1,6 @@
 import type { Category, Day, PlanItem, Spot, Trip, TripSnapshot } from '../types';
 import { hasCoords } from './geo';
-import { uid } from './util';
+import { formatDayDate, uid } from './util';
 
 export const CATEGORIES: Category[] = ['sight', 'breakfast', 'meal'];
 
@@ -26,6 +26,13 @@ export function newTrip(init: { name: string; destination: string; startDate?: s
     createdAt: now,
     updatedAt: now,
   };
+}
+
+/** "上海 · 10/20（一） 出發 · 5 天 · 32 個地點" */
+export function tripSummary(t: Trip): string {
+  return [t.destination, t.startDate && `${formatDayDate(t.startDate, 0)} 出發`, `${t.days.length} 天`, `${t.spots.length} 個地點`]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 export function snapshotOf(t: TripSnapshot): TripSnapshot {
