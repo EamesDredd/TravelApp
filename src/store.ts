@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { ChatMessage, Day, LatLng, MapRegion, PlanItem, Settings, Spot, Trip, TripSnapshot } from './types';
 import { hasCoords } from './lib/geo';
 import { normName } from './lib/placeMatch';
+import { syncStamp } from './lib/share';
 import { keepLocations, makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays, withRelocation } from './lib/tripOps';
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -39,7 +40,12 @@ interface State {
   selectDay(i: number): void;
 
   createTrip(init: { name: string; destination: string; startDate?: string; dayCount: number }): string;
+  /** Adds a trip from another device (a fresh id if this one is taken) and opens it. */
   importTrip(trip: Trip): string;
+  /** Replaces a trip with its updated version from another device (which may carry a new id) and opens it. */
+  replaceTrip(targetId: string, trip: Trip): void;
+  /** Notes the version being shared from this device, without counting as a change. */
+  markSynced(tripId: string): void;
   selectTrip(id: string): void;
   deleteTrip(id: string): void;
   updateTrip(patch: Partial<Pick<Trip, 'name' | 'destination' | 'startDate' | 'mapRegion' | 'center'>>): void;
@@ -115,6 +121,15 @@ export const useStore = create<State>()(
           set((st) => ({ trips: [...st.trips, t], currentTripId: t.id, selectedDay: 0 }));
           return t.id;
         },
+        replaceTrip: (targetId, trip) =>
+          set((st) => {
+            if (!st.trips.some((t) => t.id === targetId)) return {};
+            const taken = trip.id !== targetId && st.trips.some((t) => t.id === trip.id);
+            const t = taken ? { ...trip, id: targetId } : trip;
+            return { trips: st.trips.map((x) => (x.id === targetId ? t : x)), currentTripId: t.id, selectedDay: 0 };
+          }),
+        markSynced: (tripId) =>
+          set((st) => ({ trips: st.trips.map((t) => (t.id === tripId ? { ...t, synced: syncStamp(t) } : t)) })),
         selectTrip: (id) => set({ currentTripId: id, selectedDay: 0 }),
         deleteTrip: (id) =>
           set((st) => {

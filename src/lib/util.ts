@@ -35,6 +35,14 @@ export function toIsoDate(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+/** "10/17 15:20", with the year when it is not this year. */
+export function formatStamp(ms: number, now = new Date()): string {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, '0');
+  const date = `${d.getMonth() + 1}/${d.getDate()}`;
+  return `${d.getFullYear() === now.getFullYear() ? date : `${d.getFullYear()}/${date}`} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 export function weekdayName(d: Date): string {
   return `週${WEEKDAYS[d.getDay()]}`;
 }

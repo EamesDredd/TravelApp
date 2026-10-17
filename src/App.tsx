@@ -4,6 +4,7 @@ import { CandidatePool } from './components/CandidatePool';
 import { ChatPanel } from './components/ChatPanel';
 import { DayPlan } from './components/DayPlan';
 import { ExportPdfModal } from './components/ExportPdfModal';
+import { ImportTripModal } from './components/ImportTripModal';
 import { DayPickerModal, SpotPickerModal } from './components/Pickers';
 import { RouteModal } from './components/RouteModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -23,20 +24,21 @@ export default function App() {
   const toast = useUI((s) => s.toast);
   useAutoLocate();
 
-  // Import a trip opened from a share link (#trip=...).
+  // Import a trip opened from a share link (#trip=...), also one pasted into an open tab.
   useEffect(() => {
-    const hash = sharedTripInHash();
-    if (!hash) return;
-    history.replaceState(null, '', location.pathname + location.search);
-    try {
-      const t = parseTrip(hash);
-      if (confirm(`匯入分享的行程「${t.name}」？`)) {
-        useStore.getState().importTrip(t);
-        useUI.getState().showToast('已匯入行程');
+    const check = () => {
+      const hash = sharedTripInHash();
+      if (!hash) return;
+      history.replaceState(null, '', location.pathname + location.search);
+      try {
+        useUI.getState().openImport(parseTrip(hash));
+      } catch (err) {
+        alert(`無法讀取分享連結：${(err as Error).message}`);
       }
-    } catch (err) {
-      alert(`無法讀取分享連結：${(err as Error).message}`);
-    }
+    };
+    check();
+    window.addEventListener('hashchange', check);
+    return () => window.removeEventListener('hashchange', check);
   }, []);
 
   return (
@@ -69,6 +71,7 @@ export default function App() {
       <SpotPickerModal />
       <TripsModal />
       <ExportPdfModal />
+      <ImportTripModal />
       <SettingsModal />
       {toast && <div className="toast">{toast}</div>}
     </>

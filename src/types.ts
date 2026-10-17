@@ -109,6 +109,11 @@ export interface Trip extends TripSnapshot {
   chat: ChatMessage[];
   createdAt: number;
   updatedAt: number;
+  /**
+   * The version last shared from or imported into this device: its plan fingerprint and when it
+   * was last changed (0 if unknown). Tells, on the next import, whether this copy was edited since.
+   */
+  synced?: { fp: string; at: number };
 }
 
 /** relay = send to the user's own Claude / ChatGPT app (no API key). */
