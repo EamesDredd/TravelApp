@@ -2,14 +2,15 @@ import { compressToEncodedURIComponent } from 'lz-string';
 import { describe, expect, it } from 'vitest';
 import type { Trip } from '../../types';
 import {
-  checkImport,
+  compareImport,
   exportJson,
   importedAsNew,
   importTarget,
   looksLikeTrip,
   mergeImported,
   parseTrip,
-  syncStamp,
+  planFingerprint,
+  sharedStamp,
   updateByDefault,
 } from '../share';
 import { formatStamp } from '../util';
@@ -23,13 +24,14 @@ function phoneTrip(): Trip {
     mapRegion: 'cn',
     center: { lat: 31.23, lng: 121.47 },
     days: [
-      { id: 'd1', items: [{ id: 'i1', spotId: 's_bund', time: '09:00' }] },
-      { id: 'd2', items: [{ id: 'i2', spotId: 's_yuyu' }] },
+      { id: 'd_aaaaaa', items: [{ id: 'i1', spotId: 's_bund', time: '09:00' }] },
+      { id: 'd_bbbbbb', title: '老城區', items: [{ id: 'i2', spotId: 's_yuyu' }] },
     ],
     spots: [
-      { id: 's_bund', name: '外灘', category: 'sight', lat: 31.24, lng: 121.49, geo: 'auto' },
-      { id: 's_yuyu', name: '豫園', category: 'sight', search: { summary: '明代園林', sources: [], provider: 'claude', at: 1 } },
-      { id: 's_hotel', name: '上海武宁筑格酒店', category: 'sight', address: '武宁路501号' },
+      // makeSpot puts the id last.
+      { name: '外灘', category: 'sight', lat: 31.24, lng: 121.49, geo: 'auto', id: 's_bund' },
+      { name: '豫園', category: 'sight', search: { summary: '明代園林', sources: [], provider: 'claude', at: 1 }, id: 's_yuyu' },
+      { name: '上海武宁筑格酒店', category: 'sight', address: '武宁路501号', lat: undefined, lng: undefined, id: 's_hotel' },
     ],
     chat: [{ id: 'm1', role: 'user', text: '幫我排行程', at: 1 }],
     createdAt: 100,
@@ -44,23 +46,35 @@ function link(t: Trip): string {
   return `https://eamesdredd.github.io/TravelApp/#trip=${compressToEncodedURIComponent(JSON.stringify(d))}`;
 }
 
-/** The device shares the trip (TripsModal calls markSynced). */
-const share = (t: Trip): Trip => ({ ...t, synced: syncStamp(t) });
-
-/** An edit on a device: the plan changes and updatedAt moves on. */
-function edit(t: Trip, at: number): Trip {
-  return { ...t, days: [...t.days, { id: `d_${at}`, title: '新的一天', items: [] }], updatedAt: at };
+/** The device sends the trip (TripsModal calls markSynced afterwards). */
+function share(t: Trip): { url: string; after: Trip } {
+  return { url: link(t), after: { ...t, synced: sharedStamp(t) } };
 }
 
+/** An edit on a device: the plan changes and updatedAt moves on. */
+function edit(t: Trip, at: number, title = `改於 ${at}`): Trip {
+  return { ...t, days: t.days.map((d, i) => (i === 0 ? { ...d, title } : d)), updatedAt: at };
+}
+
+const relation = (local: Trip, url: string) => compareImport(local, parseTrip(url));
+
 describe('parseTrip', () => {
-  it('reads a share link with the trip id and when it changed', () => {
-    const t = phoneTrip();
-    const got = parseTrip(link(t));
+  it('reads a share link with the trip id, its time and its version history', () => {
+    const { url } = share(share(phoneTrip()).after);
+    const got = parseTrip(url);
     expect(got.linked).toBe(true);
     expect(got.trip.id).toBe('t_phone001');
     expect(got.changedAt).toBe(1000);
+    expect(got.seen).toEqual([planFingerprint(phoneTrip())]);
     expect(got.trip.spots.map((s) => s.name)).toEqual(['外灘', '豫園', '上海武宁筑格酒店']);
     expect(got.trip.chat).toEqual([]);
+  });
+
+  it('gives the same plan version on the other device', () => {
+    const t = phoneTrip();
+    expect(planFingerprint(parseTrip(link(t)).trip)).toBe(planFingerprint(t));
+    expect(planFingerprint(parseTrip(exportJson(t)).trip)).toBe(planFingerprint(t));
+    expect(planFingerprint(edit(t, 2))).not.toBe(planFingerprint(t));
   });
 
   it('finds the link inside a pasted message, also percent-encoded', () => {
@@ -76,14 +90,16 @@ describe('parseTrip', () => {
     expect(got.trip.spots[1].search?.summary).toBe('明代園林');
   });
 
-  it('gives links and files from before ids were shared a fresh id', () => {
+  it('reads links and files from before ids were shared', () => {
     const d = JSON.parse(exportJson(phoneTrip()));
     delete d.id;
     delete d.updatedAt;
+    delete d.seen;
     const got = parseTrip(JSON.stringify(d));
     expect(got.linked).toBe(false);
     expect(got.trip.id).not.toBe('t_phone001');
     expect(got.changedAt).toBeUndefined();
+    expect(got.seen).toBeUndefined();
   });
 
   it('does not trust odd ids', () => {
@@ -92,6 +108,36 @@ describe('parseTrip', () => {
       d.id = id;
       expect(parseTrip(JSON.stringify(d)).linked).toBe(false);
     }
+  });
+
+  it('keeps only what the app can show from hand-made data', () => {
+    const got = parseTrip(
+      JSON.stringify({
+        name: { x: 1 },
+        destination: 5,
+        startDate: 'tomorrow',
+        center: { lat: 'a', lng: 1 },
+        updatedAt: 1e300,
+        seen: ['ok', 7, 'x'.repeat(99)],
+        days: [{ title: 3 }, 'x', { id: 'd1', items: [{ id: 'i1', spotId: 's1', note: {} }, { id: 'i2', spotId: 'gone' }, null] }],
+        spots: [
+          { id: 's1', name: '甲', category: 'shop', note: { a: 1 }, lat: '31', lng: 121, geo: 'auto', search: { summary: 's', sources: [{ title: 't', url: 'javascript:alert(1)' }, { title: 'u', url: 'https://a.b' }] } },
+          { id: 's1', name: '重複' },
+          { id: 's2' },
+          null,
+        ],
+      }),
+    );
+    expect(got.trip.name).toBe('匯入的行程');
+    expect(got.trip.destination).toBe('');
+    expect(got.trip.startDate).toBeUndefined();
+    expect(got.trip.center).toBeUndefined();
+    expect(got.changedAt).toBeUndefined();
+    expect(got.seen).toEqual(['ok']);
+    expect(got.trip.spots).toEqual([{ id: 's1', name: '甲', category: 'sight', search: { summary: 's', sources: [{ title: 'u', url: 'https://a.b' }], provider: '', at: 0 } }]);
+    expect(got.trip.days).toHaveLength(2);
+    expect(got.trip.days[0].items).toEqual([]);
+    expect(got.trip.days[1]).toEqual({ id: 'd1', items: [{ id: 'i1', spotId: 's1' }] });
   });
 
   it('explains broken or unrelated text', () => {
@@ -109,134 +155,189 @@ describe('parseTrip', () => {
   });
 });
 
-describe('importing on another device', () => {
-  it('round trip phone → computer → phone updates the same trip without warnings', () => {
-    // Phone shares; the computer adds it as a new trip with the same id.
-    let phone = share(phoneTrip());
-    let computer = importedAsNew(parseTrip(link(phone)), 1500);
+describe('which copy is newer', () => {
+  it('round trip phone → computer → phone: the update is safe', () => {
+    const s1 = share(phoneTrip());
+    let phone = s1.after;
+    let computer = importedAsNew(parseTrip(s1.url), 1500);
     expect(computer.id).toBe(phone.id);
-    expect(importTarget([], parseTrip(link(phone)))).toBeNull();
 
-    // Edited on the computer, shared back.
-    computer = share(edit(computer, 2000));
-    const incoming = parseTrip(link(computer));
-    const target = importTarget([phone], incoming)!;
-    expect(target).toEqual({ trip: phone, byName: false });
-    expect(updateByDefault(target)).toBe(true);
-    expect(checkImport(phone, incoming)).toEqual({ same: false, editedHere: false, olderThan: undefined });
+    const s2 = share(edit(computer, 2000));
+    computer = s2.after;
+    const target = importTarget([phone], parseTrip(s2.url))!;
+    expect(target).toEqual({ trip: phone, match: 'id' });
+    expect(relation(phone, s2.url)).toBe('newer');
+    expect(updateByDefault(target, 'newer')).toBe(true);
 
-    phone = mergeImported(phone, incoming, 2500);
+    phone = mergeImported(phone, parseTrip(s2.url), 2500);
     expect(phone.id).toBe('t_phone001');
-    expect(phone.days).toHaveLength(3);
+    expect(phone.days[0].title).toBe('改於 2000');
     expect(phone.chat).toHaveLength(1);
     expect(phone.createdAt).toBe(100);
     expect(phone.updatedAt).toBe(2500);
-    // Nothing changed since: importing the same link again is a no-op.
-    expect(checkImport(phone, incoming)).toEqual({ same: true, editedHere: false, olderThan: undefined });
+    expect(relation(phone, s2.url)).toBe('same');
+    // Back on the computer, the phone's next edit is newer too.
+    expect(relation(computer, share(edit(phone, 3000, '手機再改')).url)).toBe('newer');
   });
 
-  it('warns when this copy was edited after the last share', () => {
-    const phone = share(phoneTrip());
-    const computer = share(edit(importedAsNew(parseTrip(link(phone)), 1500), 2000));
-    const phoneEdited = { ...phone, days: phone.days.slice(0, 1), updatedAt: 1800 };
-    expect(checkImport(phoneEdited, parseTrip(link(computer))).editedHere).toBe(true);
+  it('several rounds keep working', () => {
+    let a = phoneTrip();
+    let b: Trip | null = null;
+    for (let round = 1; round <= 30; round++) {
+      const s = share(edit(a, round * 10, `A${round}`));
+      a = s.after;
+      b = b ? mergeImported(b, parseTrip(s.url)) : importedAsNew(parseTrip(s.url));
+      expect(b && relation(b, s.url)).toBe('same');
+      const back = share(edit(b!, round * 10 + 5, `B${round}`));
+      b = back.after;
+      expect(relation(a, back.url)).toBe('newer');
+      a = mergeImported(a, parseTrip(back.url));
+    }
+    expect(a.synced!.seen.length).toBeLessThanOrEqual(20);
   });
 
-  it('warns when an older link is opened again', () => {
-    const phone = share(phoneTrip());
-    const oldLink = link(phone);
-    const computer = share(edit(importedAsNew(parseTrip(oldLink), 1500), 2000));
-    const updated = mergeImported(phone, parseTrip(link(computer)), 2500);
-    const check = checkImport(updated, parseTrip(oldLink));
-    expect(check.olderThan).toBe(2000);
-    expect(check.same).toBe(false);
-    expect(check.editedHere).toBe(false);
+  it('crossing shares: both copies changed, so neither update is called safe', () => {
+    const s1 = share(phoneTrip());
+    const a = s1.after;
+    const b = importedAsNew(parseTrip(s1.url));
+    const fromB = share(edit(b, 2000, 'B 的修改'));
+    const fromA = share(edit(a, 2100, 'A 的修改'));
+    expect(relation(fromB.after, fromA.url)).toBe('diverged');
+    expect(relation(fromA.after, fromB.url)).toBe('diverged');
+    expect(updateByDefault({ trip: a, match: 'id' }, 'diverged')).toBe(false);
+  });
+
+  it('a third device: changes that never reached the sender are not lost silently', () => {
+    const s1 = share(phoneTrip());
+    let a = s1.after;
+    const b = importedAsNew(parseTrip(s1.url));
+    const c = importedAsNew(parseTrip(s1.url));
+    const fromB = share(edit(b, 2000, 'B'));
+    a = mergeImported(a, parseTrip(fromB.url));
+    const fromC = share(edit(c, 2100, 'C'));
+    expect(relation(a, fromC.url)).toBe('diverged');
+  });
+
+  it('a share that never arrived does not hide changes made here', () => {
+    const s1 = share(phoneTrip());
+    const b = importedAsNew(parseTrip(s1.url));
+    // The phone edits and starts a share that is cancelled: it still counts as sent here.
+    const unsent = share(edit(s1.after, 1500, '手機的修改')).after;
+    const fromB = share(edit(b, 2000, '電腦的修改'));
+    expect(relation(unsent, fromB.url)).toBe('diverged');
+  });
+
+  it('an older link opened again is older, not newer', () => {
+    const s1 = share(phoneTrip());
+    const computer = importedAsNew(parseTrip(s1.url));
+    const s2 = share(edit(computer, 2000));
+    const phone = mergeImported(s1.after, parseTrip(s2.url));
+    expect(relation(phone, s1.url)).toBe('older');
+    expect(updateByDefault({ trip: phone, match: 'id' }, 'older')).toBe(false);
+    // The computer, too, after a later edit of its own.
+    expect(relation(share(edit(s2.after, 3000, '再改')).after, s1.url)).toBe('older');
+  });
+
+  it('locations found or picked on either side are not plan changes', () => {
+    const s1 = share(phoneTrip());
+    const computer = importedAsNew(parseTrip(s1.url));
+    computer.spots = computer.spots.map((s) => (s.id === 's_hotel' ? { ...s, lat: 31.25, lng: 121.42, geo: 'auto' as const } : s));
+    const phone = { ...s1.after, spots: s1.after.spots.map((s) => (s.id === 's_bund' ? { ...s, lat: 31.2, lng: 121.5, geo: 'manual' as const } : s)) };
+    expect(relation(phone, share(computer).url)).toBe('same');
   });
 
   it('keeps the plan time while only chat or found locations changed', () => {
-    const t = share(phoneTrip());
+    const t = share(phoneTrip()).after;
     const chatted = { ...t, chat: [...t.chat, { id: 'm2', role: 'user' as const, text: 'hi', at: 2 }], updatedAt: 5000 };
-    expect(syncStamp(chatted)).toEqual(t.synced);
-    const located = {
-      ...t,
-      spots: t.spots.map((s) => (s.id === 's_hotel' ? { ...s, lat: 31.25, lng: 121.42, geo: 'auto' as const } : s)),
-      updatedAt: 6000,
-    };
-    expect(syncStamp(located)).toEqual(t.synced);
-    expect(syncStamp(edit(t, 7000)).at).toBe(7000);
-    // Never synced: the trip's own time.
-    expect(syncStamp(phoneTrip()).at).toBe(1000);
+    expect(sharedStamp(chatted)).toBe(t.synced);
+    const changed = sharedStamp(edit(t, 7000));
+    expect(changed.at).toBe(7000);
+    expect(changed.seen).toEqual([planFingerprint(edit(t, 7000)), planFingerprint(t)]);
+    expect(sharedStamp(phoneTrip())).toEqual({ seen: [planFingerprint(phoneTrip())], at: 1000 });
   });
+});
 
-  it('counts the same plan as the same, even with different found locations', () => {
-    const phone = share(phoneTrip());
-    const incoming = parseTrip(link(phone));
-    incoming.trip.spots[0] = { ...incoming.trip.spots[0], lat: 31.2401, lng: 121.4901 };
-    expect(checkImport(phone, incoming).same).toBe(true);
-  });
-
-  it('matches a copy made before ids were shared by name, and links it', () => {
-    const phone = phoneTrip(); // legacy: never synced
-    const computerCopy = share({ ...phoneTrip(), id: 't_comp0001', chat: [] });
-    const incoming = parseTrip(link(edit(computerCopy, 3000)));
-    const target = importTarget([phone], incoming)!;
-    expect(target.byName).toBe(true);
-    expect(updateByDefault(target)).toBe(true);
-    const merged = mergeImported(phone, incoming, 3500);
+describe('importTarget', () => {
+  it('matches a copy made before ids were shared by its days and places, and links it', () => {
+    const phone = phoneTrip(); // never shared
+    const computerCopy = share({ ...phoneTrip(), id: 't_comp0001', name: '上海（電腦）', chat: [] });
+    const url = share(edit(computerCopy.after, 3000)).url;
+    const target = importTarget([phone], parseTrip(url))!;
+    expect(target.match).toBe('copy');
+    expect(relation(phone, url)).toBe('unknown');
+    expect(updateByDefault(target, 'unknown')).toBe(true);
+    const merged = mergeImported(phone, parseTrip(url), 3500);
     expect(merged.id).toBe('t_comp0001');
     expect(merged.chat).toHaveLength(1);
+  });
+
+  it('does not offer to overwrite a different trip that only has the same name', () => {
+    const lastYear: Trip = { ...phoneTrip(), id: 't_2025', startDate: '2025-04-01', days: [{ id: 'd_zzzzzz', items: [] }], spots: [] };
+    const url = link({ ...phoneTrip(), id: 't_new' });
+    const target = importTarget([lastYear], parseTrip(url))!;
+    expect(target.match).toBe('name');
+    expect(relation(lastYear, url)).toBe('unknown');
+    expect(updateByDefault(target, 'unknown')).toBe(false);
+  });
+
+  it('a single shared place id is not enough to call it a copy', () => {
+    const other: Trip = { ...phoneTrip(), id: 't_other', name: '別的', days: [{ id: 'd_zzzzzz', items: [] }], spots: [phoneTrip().spots[0]] };
+    expect(importTarget([other], parseTrip(link(phoneTrip())))).toBeNull();
+  });
+
+  it('prefers the same id, then a copy with the name, then any copy, then the latest with the name', () => {
+    const unrelated = (id: string, name: string, updatedAt: number): Trip => ({ ...phoneTrip(), id, name, updatedAt, days: [{ id: `d_${id}`, items: [] }], spots: [] });
+    const a = unrelated('t_a', '上海之旅', 10);
+    const b = unrelated('t_b', ' 上海 之旅 ', 30);
+    const copyOther = { ...phoneTrip(), id: 't_c', name: '改名了', updatedAt: 5 };
+    const copySame = { ...phoneTrip(), id: 't_d', updatedAt: 1 };
+    const incoming = parseTrip(link({ ...phoneTrip(), id: 't_new' }));
+    expect(importTarget([a, b], incoming)).toEqual({ trip: b, match: 'name' });
+    expect(importTarget([a, b, copyOther], incoming)).toEqual({ trip: copyOther, match: 'copy' });
+    expect(importTarget([a, b, copyOther, copySame], incoming)).toEqual({ trip: copySame, match: 'copy' });
+    expect(importTarget([a, b, copyOther, copySame], parseTrip(link({ ...phoneTrip(), id: 't_a' })))).toEqual({ trip: a, match: 'id' });
+    expect(importTarget([{ ...a, name: '京都' }], parseTrip(link({ ...phoneTrip(), id: 't_new', days: [{ id: 'd_x', items: [] }], spots: [] })))).toBeNull();
   });
 
   it('keeps the local id for links from before ids were shared', () => {
     const d = JSON.parse(exportJson(phoneTrip()));
     delete d.id;
-    const incoming = parseTrip(JSON.stringify(d));
     const local = { ...phoneTrip(), id: 't_local001' };
-    expect(importTarget([local], incoming)?.byName).toBe(true);
-    expect(mergeImported(local, incoming).id).toBe('t_local001');
-  });
-
-  it('does not update a different synced trip by default just because the name matches', () => {
-    const other = share({ ...phoneTrip(), id: 't_other001', startDate: '2025-04-01' });
-    const incoming = parseTrip(link(phoneTrip()));
-    const target = importTarget([other], incoming)!;
-    expect(target.byName).toBe(true);
-    expect(updateByDefault(target)).toBe(false);
-  });
-
-  it('prefers the same id, then the latest trip with the name', () => {
-    const a = { ...phoneTrip(), id: 't_a', updatedAt: 10 };
-    const b = { ...phoneTrip(), id: 't_b', updatedAt: 30 };
-    const c = { ...phoneTrip(), id: 't_c', name: ' 上海 之旅 ', updatedAt: 20 };
-    const incoming = parseTrip(link({ ...phoneTrip(), id: 't_new' }));
-    expect(importTarget([a, b, c], incoming)?.trip.id).toBe('t_b');
-    const same = parseTrip(link({ ...phoneTrip(), id: 't_a' }));
-    expect(importTarget([a, b, c], same)).toEqual({ trip: a, byName: false });
-    expect(importTarget([{ ...a, name: '京都' }], incoming)).toBeNull();
+    expect(mergeImported(local, parseTrip(JSON.stringify(d))).id).toBe('t_local001');
   });
 });
 
 describe('mergeImported', () => {
-  it('keeps web searches and found locations the import does not have', () => {
+  it('keeps web searches and locations found here, unless the import has a better location', () => {
     const local = phoneTrip();
-    local.spots[2] = { ...local.spots[2], lat: 31.25, lng: 121.42, geo: 'manual' };
-    const remote = { ...phoneTrip(), spots: phoneTrip().spots.map((s) => (s.id === 's_bund' ? { ...s, lat: 31.2, lng: 121.5, geo: undefined } : s)) };
-    const merged = mergeImported(local, parseTrip(link(remote)));
-    const byId = Object.fromEntries(merged.spots.map((s) => [s.id, s]));
+    local.spots = local.spots.map((s) =>
+      s.id === 's_hotel' ? { ...s, lat: 31.25, lng: 121.42, geo: 'manual' as const } : s.id === 's_bund' ? { ...s, geo: 'manual' as const } : s,
+    );
+    const remote = phoneTrip();
+    remote.spots = remote.spots.map((s) =>
+      s.id === 's_hotel' ? { ...s, lat: 31.3, lng: 121.4, geo: 'auto' as const } : s.id === 's_yuyu' ? { ...s, lat: 31.227, lng: 121.492 } : s,
+    );
+    const local2 = { ...local, spots: [...local.spots] };
+    local2.spots[1] = { ...local2.spots[1], lat: 31.1, lng: 121.1, geo: 'auto' };
+    const byId = Object.fromEntries(mergeImported(local2, parseTrip(link(remote))).spots.map((s) => [s.id, s]));
     expect(byId.s_yuyu.search?.summary).toBe('明代園林');
+    // Picked by hand here beats found automatically there.
     expect(byId.s_hotel).toMatchObject({ lat: 31.25, lng: 121.42, geo: 'manual' });
-    // Coordinates that came with the import win.
-    expect(byId.s_bund).toMatchObject({ lat: 31.2, lng: 121.5 });
-    expect(byId.s_bund.geo).toBeUndefined();
+    // Coordinates that came with the import beat ones found automatically here.
+    expect(byId.s_yuyu).toMatchObject({ lat: 31.227, lng: 121.492 });
+    expect(byId.s_yuyu.geo).toBeUndefined();
+
+    const pickedThere = phoneTrip();
+    pickedThere.spots = pickedThere.spots.map((s) => (s.id === 's_hotel' ? { ...s, lat: 31.26, lng: 121.43, geo: 'manual' as const } : s));
+    const fromThere = Object.fromEntries(mergeImported(local, parseTrip(link(pickedThere))).spots.map((s) => [s.id, s]));
+    expect(fromThere.s_hotel).toMatchObject({ lat: 31.26, lng: 121.43, geo: 'manual' });
   });
 
   it('drops what belonged to a place that was renamed on the other device', () => {
     const local = phoneTrip();
     local.spots[2] = { ...local.spots[2], lat: 31.25, lng: 121.42, geo: 'auto' };
     const remote = phoneTrip();
-    remote.spots = remote.spots.map((s) =>
-      s.id === 's_yuyu' ? { ...s, name: '城隍廟' } : s.id === 's_hotel' ? { ...s, name: '和平飯店' } : s,
-    );
+    remote.spots = remote.spots.map((s) => (s.id === 's_yuyu' ? { ...s, name: '城隍廟' } : s.id === 's_hotel' ? { ...s, name: '和平飯店' } : s));
     const byId = Object.fromEntries(mergeImported(local, parseTrip(link(remote))).spots.map((s) => [s.id, s]));
     expect(byId.s_yuyu.search).toBeUndefined();
     expect(byId.s_hotel.lat).toBeUndefined();
@@ -248,8 +349,7 @@ describe('mergeImported', () => {
     const merged = mergeImported(local, parseTrip(link(remote)));
     expect(merged).toMatchObject({ name: '上海＋杭州', mapRegion: 'auto', center: local.center });
     expect(merged.startDate).toBeUndefined();
-    const moved = mergeImported(local, parseTrip(link({ ...remote, destination: '杭州' })));
-    expect(moved.center).toBeUndefined();
+    expect(mergeImported(local, parseTrip(link({ ...remote, destination: '杭州' }))).center).toBeUndefined();
   });
 });
 

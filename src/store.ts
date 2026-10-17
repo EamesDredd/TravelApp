@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { ChatMessage, Day, LatLng, MapRegion, PlanItem, Settings, Spot, Trip, TripSnapshot } from './types';
 import { hasCoords } from './lib/geo';
 import { normName } from './lib/placeMatch';
-import { syncStamp } from './lib/share';
+import { sharedStamp } from './lib/share';
 import { keepLocations, makeItem, makeSpot, newDay, newTrip, removeSpotEverywhere, resizeDays, withRelocation } from './lib/tripOps';
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -129,7 +129,7 @@ export const useStore = create<State>()(
             return { trips: st.trips.map((x) => (x.id === targetId ? t : x)), currentTripId: t.id, selectedDay: 0 };
           }),
         markSynced: (tripId) =>
-          set((st) => ({ trips: st.trips.map((t) => (t.id === tripId ? { ...t, synced: syncStamp(t) } : t)) })),
+          set((st) => ({ trips: st.trips.map((t) => (t.id === tripId ? { ...t, synced: sharedStamp(t) } : t)) })),
         selectTrip: (id) => set({ currentTripId: id, selectedDay: 0 }),
         deleteTrip: (id) =>
           set((st) => {

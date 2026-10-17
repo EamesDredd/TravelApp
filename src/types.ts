@@ -110,10 +110,11 @@ export interface Trip extends TripSnapshot {
   createdAt: number;
   updatedAt: number;
   /**
-   * The version last shared from or imported into this device: its plan fingerprint and when it
-   * was last changed (0 if unknown). Tells, on the next import, whether this copy was edited since.
+   * Plan versions this copy is built on, newest first (fingerprints of versions shared from or
+   * imported into this device, and of the versions those were built on), and when the newest one
+   * last changed (0 if unknown). Tells, on an import, which of the two copies is newer.
    */
-  synced?: { fp: string; at: number };
+  synced?: { seen: string[]; at: number };
 }
 
 /** relay = send to the user's own Claude / ChatGPT app (no API key). */

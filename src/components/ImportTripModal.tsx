@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { checkImport, importedAsNew, importTarget, mergeImported, updateByDefault, type IncomingTrip } from '../lib/share';
+import { compareImport, importedAsNew, importTarget, mergeImported, updateByDefault, type ImportRelation, type IncomingTrip } from '../lib/share';
 import { tripSummary } from '../lib/tripOps';
 import { formatStamp } from '../lib/util';
 import { useStore } from '../store';
@@ -17,9 +17,10 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
   const trips = useStore((s) => s.trips);
   const ui = useUI();
   const target = importTarget(trips, incoming);
-  const [choice, setChoice] = useState<'update' | 'new'>(() => (target && updateByDefault(target) ? 'update' : 'new'));
+  const relation = target ? compareImport(target.trip, incoming) : null;
+  const safe = !!target && !!relation && updateByDefault(target, relation);
+  const [choice, setChoice] = useState<'update' | 'new'>(() => (safe ? 'update' : 'new'));
   const update = !!target && choice === 'update';
-  const check = target ? checkImport(target.trip, incoming) : null;
   const t = incoming.trip;
   const close = () => ui.openImport(null);
 
@@ -48,7 +49,7 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
           </button>
           <span className="grow" />
           <button className="btn btn-primary" onClick={submit}>
-            {update ? '更新行程' : '匯入'}
+            {update ? (safe ? '更新行程' : '仍要更新') : '匯入'}
           </button>
         </>
       }
@@ -59,28 +60,19 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
         {incoming.changedAt && <div className="small muted">{formatStamp(incoming.changedAt)} 的版本</div>}
       </div>
 
-      {target && check ? (
+      {target && relation ? (
         <div role="radiogroup" aria-label="匯入方式">
           <label className="choice">
             <input type="radio" name="import-mode" checked={choice === 'update'} onChange={() => setChoice('update')} />
             <div>
-              <b>{target.byName ? '更新這台裝置上同名的行程' : '更新這台裝置上的這個行程'}</b>
+              <b>{target.match === 'name' ? '更新這台裝置上同名的行程' : '更新這台裝置上的這個行程'}</b>
               <div className="small muted">
                 「{target.trip.name}」 · {tripSummary(target.trip)}
               </div>
-              {target.byName && target.trip.synced && <div className="small muted">名稱相同，但可能是另一個行程，請先確認。</div>}
-              {check.olderThan && (
-                <div className="small warn">⚠️ 匯入的是比較舊的版本，這台裝置上次同步的是 {formatStamp(check.olderThan)} 的版本。</div>
+              {target.match === 'name' && relation === 'unknown' && (
+                <div className="small warn">名稱相同，但可能是另一個行程，請先確認。</div>
               )}
-              {check.same ? (
-                <div className="small muted">內容和這台裝置上的一樣。</div>
-              ) : check.editedHere ? (
-                <div className="small warn">⚠️ 這台裝置上的行程在上次分享或匯入後有修改，更新會取代這些修改。</div>
-              ) : check.editedHere === false ? (
-                <div className="small muted">這台裝置上沒有新的修改，可以放心更新。</div>
-              ) : (
-                <div className="small muted">更新後會換成匯入的內容。</div>
-              )}
+              <RelationNote relation={relation} />
             </div>
           </label>
           <label className="choice">
@@ -100,4 +92,20 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
       </p>
     </Modal>
   );
+}
+
+const NOTES: Record<ImportRelation, { text: string; warn?: boolean }> = {
+  same: { text: '內容和這台裝置上的一樣。' },
+  newer: { text: '這個版本是接著這台裝置上的行程修改的，可以放心更新。' },
+  older: { text: '⚠️ 這是比較舊的版本：這台裝置上的行程已經有之後的修改，更新會換回舊版。', warn: true },
+  diverged: {
+    text: '⚠️ 兩邊各自改過：這台裝置上有些修改不在匯入的版本裡，更新會失去這些修改。想兩份都留，請選「另存成新的行程」。',
+    warn: true,
+  },
+  unknown: { text: '更新後會換成匯入的內容。' },
+};
+
+function RelationNote({ relation }: { relation: ImportRelation }) {
+  const note = NOTES[relation];
+  return <div className={`small ${note.warn ? 'warn' : 'muted'}`}>{note.text}</div>;
 }
