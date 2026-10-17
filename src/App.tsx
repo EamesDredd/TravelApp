@@ -11,6 +11,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { SpotDetail } from './components/SpotDetail';
 import { TripForm, TripsModal } from './components/TripsModal';
 import { hasCoords } from './lib/geo';
+import { forgetLocate, pendingLocate } from './lib/pendingLocate';
 import { parseTrip, sharedTripInHash } from './lib/share';
 import { formatDayDate } from './lib/util';
 import { locator } from './locator';
@@ -23,6 +24,20 @@ export default function App() {
   const chatOpen = useStore((s) => s.chatOpen);
   const toast = useUI((s) => s.toast);
   useAutoLocate();
+
+  // Back from looking a place up in the Amap app after iPhone closed the app: reopen the dialog.
+  useEffect(() => {
+    const p = pendingLocate();
+    if (!p) return;
+    const st = useStore.getState();
+    const t = st.trips.find((x) => x.id === p.tripId);
+    if (!t || (p.opts.locateId && !t.spots.some((s) => s.id === p.opts.locateId))) {
+      forgetLocate();
+      return;
+    }
+    if (st.currentTripId !== t.id) st.selectTrip(t.id);
+    useUI.getState().openAddSpot({ ...p.opts, restored: true });
+  }, []);
 
   // Import a trip opened from a share link (#trip=...), also one pasted into an open tab.
   useEffect(() => {

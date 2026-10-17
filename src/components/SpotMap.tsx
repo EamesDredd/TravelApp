@@ -7,7 +7,7 @@ import { CATEGORY_ICON } from '../types';
 import { LeafletMap } from './LeafletMap';
 import { MapAppLink } from './MapAppLink';
 
-const CAT_COLOR = { sight: '#0f766e', breakfast: '#b45309', meal: '#be185d' } as const;
+export const CAT_COLOR = { sight: '#0f766e', breakfast: '#b45309', meal: '#be185d' } as const;
 
 /** Small map for one place: Google Maps outside mainland China, Amap tiles inside. */
 export function SpotMap({ spot, region, destination }: { spot: Spot; region: ResolvedRegion; destination: string }) {
