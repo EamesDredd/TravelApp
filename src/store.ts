@@ -44,8 +44,8 @@ interface State {
   importTrip(trip: Trip): string;
   /** Replaces a trip with its updated version from another device (which may carry a new id) and opens it. */
   replaceTrip(targetId: string, trip: Trip): void;
-  /** Notes the version being shared from this device, without counting as a change. */
-  markSynced(tripId: string): void;
+  /** Notes the version that was shared from this device (as it was put in the link), without counting as a change. */
+  markSynced(sent: Trip): void;
   selectTrip(id: string): void;
   deleteTrip(id: string): void;
   updateTrip(patch: Partial<Pick<Trip, 'name' | 'destination' | 'startDate' | 'mapRegion' | 'center'>>): void;
@@ -128,8 +128,8 @@ export const useStore = create<State>()(
             const t = taken ? { ...trip, id: targetId } : trip;
             return { trips: st.trips.map((x) => (x.id === targetId ? t : x)), currentTripId: t.id, selectedDay: 0 };
           }),
-        markSynced: (tripId) =>
-          set((st) => ({ trips: st.trips.map((t) => (t.id === tripId ? { ...t, synced: sharedStamp(t) } : t)) })),
+        markSynced: (sent) =>
+          set((st) => ({ trips: st.trips.map((t) => (t.id === sent.id ? { ...t, synced: sharedStamp(sent) } : t)) })),
         selectTrip: (id) => set({ currentTripId: id, selectedDay: 0 }),
         deleteTrip: (id) =>
           set((st) => {

@@ -1,5 +1,5 @@
 import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from 'lz-string';
-import type { Day, LatLng, PlanItem, Spot, SpotSearchResult, Trip, TripSnapshot } from '../types';
+import type { ChatMessage, Day, LatLng, PlanItem, Spot, SpotSearchResult, Trip, TripSnapshot } from '../types';
 import { hasCoords } from './geo';
 import { isCategory, nameKey, newTrip } from './tripOps';
 import { uid } from './util';
@@ -8,7 +8,7 @@ const PREFIX = '#trip=';
 /** Trip ids come from uid(); anything else in the data is not trusted as one. */
 const TRIP_ID = /^[\w-]{1,40}$/;
 /** How many plan versions a copy remembers (and sends along) to tell which of two copies is newer. */
-const SEEN_MAX = 20;
+const SEEN_MAX = 40;
 
 // ---------------------------------------------------------------- plan versions
 
@@ -37,12 +37,13 @@ function canonical(v: unknown): unknown {
 }
 
 /**
- * Version of the plan, the same on every device that has it. Web searches and coordinates are
- * facts about places, merged on their own when importing (see mergeImported), so they are not
- * part of it: each copy may have located places differently.
+ * Version of the plan, the same on every device that has it. Web searches, coordinates and
+ * addresses are facts about places (locating a place also sets its address), merged on their own
+ * when importing (see mergeImported), so they are not part of it: each copy may have located
+ * places differently.
  */
 export function planFingerprint(t: TripSnapshot): string {
-  const spots = t.spots.map(({ search: _search, lat: _lat, lng: _lng, geo: _geo, ...plan }) => plan);
+  const spots = t.spots.map(({ search: _search, lat: _lat, lng: _lng, geo: _geo, address: _address, ...plan }) => plan);
   const data = JSON.stringify(canonical({ n: t.name, d: t.destination, s: t.startDate ?? null, days: t.days, spots }));
   return fnv(data, 0x811c9dc5) + fnv(data, 0x5bd1e995);
 }
@@ -234,10 +235,16 @@ function sharesPlan(a: TripSnapshot, b: TripSnapshot): boolean {
 /** The trip on this device that an import would update. */
 export function importTarget(trips: Trip[], incoming: IncomingTrip): ImportTarget | null {
   const same = incoming.linked ? trips.find((t) => t.id === incoming.trip.id) : undefined;
-  if (same) return { trip: same, match: 'id' };
   const key = nameKey(incoming.trip.name);
   const latest = (list: Trip[]) => list.reduce<Trip | undefined>((a, b) => (a && a.updatedAt >= b.updatedAt ? a : b), undefined);
-  const copies = trips.filter((t) => sharesPlan(t, incoming.trip));
+  const copies = trips.filter((t) => t !== same && sharesPlan(t, incoming.trip));
+  // A trip the import is built on loses nothing by updating. After "keep both" that is the copy
+  // that was added, while the trip that kept the id has changes of its own.
+  const follows = (t: Trip) => ['same', 'newer'].includes(compareImport(t, incoming));
+  if (same && follows(same)) return { trip: same, match: 'id' };
+  const base = latest(copies.filter(follows));
+  if (base) return { trip: base, match: 'copy' };
+  if (same) return { trip: same, match: 'id' };
   const copy = latest(copies.filter((t) => nameKey(t.name) === key)) ?? latest(copies);
   if (copy) return { trip: copy, match: 'copy' };
   const named = latest(trips.filter((t) => nameKey(t.name) === key));
@@ -255,16 +262,33 @@ export function compareImport(local: Trip, incoming: IncomingTrip): ImportRelati
   const here = planFingerprint(local);
   const there = planFingerprint(incoming.trip);
   if (here === there) return 'same';
-  if (incoming.seen?.includes(here)) return 'newer';
-  if (local.synced?.seen.includes(there)) return 'older';
-  return incoming.seen && local.synced ? 'diverged' : 'unknown';
+  const mine = local.synced?.seen ?? [];
+  const theirs = incoming.seen ?? [];
+  // Versions this copy had after its current plan: it went back to it since (an undo).
+  const left = mine.slice(0, Math.max(0, mine.indexOf(here)));
+  if (left.includes(there)) return 'older';
+  if (theirs.includes(here) && !left.some((v) => theirs.includes(v))) return 'newer';
+  if (mine.includes(there)) return 'older';
+  if (!theirs.length || !mine.length) return 'unknown';
+  // The incoming history is cut at SEEN_MAX: a copy unchanged since its last sync is most likely
+  // just behind, not changed on its own.
+  if (theirs.length >= SEEN_MAX && mine[0] === here) return 'unknown';
+  return 'diverged';
+}
+
+/** The relation shown for an import target: a trip that only shares the name has no common history. */
+export function importRelation(target: ImportTarget, incoming: IncomingTrip): ImportRelation {
+  const relation = compareImport(target.trip, incoming);
+  return target.match === 'name' && relation === 'diverged' ? 'unknown' : relation;
 }
 
 /** Update when nothing here would be lost and it is surely the same trip; otherwise keep both. */
-export function updateByDefault(target: ImportTarget, relation: ImportRelation): boolean {
+export function updateByDefault(target: ImportTarget, relation: ImportRelation, incoming: IncomingTrip): boolean {
   if (relation === 'same' || relation === 'newer') return true;
   if (relation === 'older' || relation === 'diverged') return false;
-  return target.match !== 'name';
+  // Not known which is newer. Links from before trips carried their id (opened again from a chat,
+  // say) always added a new trip, so keep doing that for them.
+  return target.match === 'id' || (target.match === 'copy' && incoming.linked);
 }
 
 /** A new trip from the import (the store gives it a fresh id if this one is taken). */
@@ -273,10 +297,17 @@ export function importedAsNew(incoming: IncomingTrip, now = Date.now()): Trip {
   return { ...t, synced: { seen: uniq([planFingerprint(t), ...(incoming.seen ?? [])]), at: incoming.changedAt ?? 0 } };
 }
 
+/** How far to trust a place's location: picked by hand, given by the AI (or from before `geo`), found by the app. */
+function withoutUndo({ undo: _undo, relayStart: _start, ...m }: ChatMessage): ChatMessage {
+  return m;
+}
+
+const trust = (s: Spot) => (!hasCoords(s) ? 0 : s.geo === 'manual' ? 3 : s.geo === 'auto' ? 1 : 2);
+
 /**
- * The local trip with the imported plan. The AI chat stays, and so do web searches and the
- * locations found here when the import has none, or only one the user did not pick. A trip matched another
- * way takes the incoming id, so the next import of that trip finds it directly.
+ * The local trip with the imported plan. The AI chat stays, and so do web searches, and the
+ * locations and addresses here that are better than the import's. A trip matched another way
+ * takes the incoming id, so the next import of that trip finds it directly.
  */
 export function mergeImported(local: Trip, incoming: IncomingTrip, now = Date.now()): Trip {
   const before = new Map(local.spots.map((s) => [s.id, s]));
@@ -284,10 +315,12 @@ export function mergeImported(local: Trip, incoming: IncomingTrip, now = Date.no
     const cur = before.get(s.id);
     if (!cur || nameKey(cur.name) !== nameKey(s.name)) return s;
     let out = !s.search && cur.search ? { ...s, search: cur.search } : s;
-    if (hasCoords(cur) && cur.geo && (!hasCoords(s) || (cur.geo === 'manual' && s.geo !== 'manual'))) {
-      out = { ...out, lat: cur.lat, lng: cur.lng, geo: cur.geo };
+    if (trust(cur) > trust(s)) {
+      // A location picked by hand comes with the address picked with it.
+      const address = cur.geo === 'manual' && cur.address ? cur.address : out.address;
+      out = { ...out, lat: cur.lat, lng: cur.lng, geo: cur.geo, address };
     }
-    return out;
+    return out.address === undefined && cur.address ? { ...out, address: cur.address } : out;
   });
   const t = incoming.trip;
   const merged: Trip = {
@@ -302,8 +335,12 @@ export function mergeImported(local: Trip, incoming: IncomingTrip, now = Date.no
     center: t.center ?? (nameKey(t.destination) === nameKey(local.destination) ? local.center : undefined),
     updatedAt: now,
   };
+  const fp = planFingerprint(merged);
+  // Undo points would bring back a plan from before the import, silently dropping the other
+  // device's changes too; the imported plan is the new starting point.
+  const chat = fp === planFingerprint(local) ? local.chat : local.chat.map(withoutUndo);
   // The versions this copy had are replaced by the import, so they count as seen too: a link
   // with one of them is older than this copy now.
-  const seen = uniq([planFingerprint(merged), ...(incoming.seen ?? []), ...(local.synced?.seen ?? [])]);
-  return { ...merged, synced: { seen, at: incoming.changedAt ?? 0 } };
+  const seen = uniq([fp, ...(incoming.seen ?? []), ...(local.synced?.seen ?? [])]);
+  return { ...merged, chat, synced: { seen, at: incoming.changedAt ?? 0 } };
 }

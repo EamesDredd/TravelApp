@@ -99,7 +99,7 @@ function TripsInner() {
     try {
       if (navigator.share) {
         await navigator.share({ title: trip.name, url });
-        markSynced(trip.id);
+        markSynced(trip);
         return;
       }
     } catch {
@@ -111,7 +111,7 @@ function TripsInner() {
     } catch {
       prompt('複製這個連結：', url);
     }
-    markSynced(trip.id);
+    markSynced(trip);
   };
 
   /** Asks how to import (update the same trip here, or add it) in its own dialog. */
@@ -277,7 +277,7 @@ function TripsInner() {
                 className="btn btn-sm"
                 onClick={() => {
                   downloadFile(`${safeFilename(trip.name)}.json`, exportJson(trip), 'application/json');
-                  markSynced(trip.id);
+                  markSynced(trip);
                 }}
               >
                 ⬇ 匯出 JSON

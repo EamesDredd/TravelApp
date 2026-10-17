@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { compareImport, importedAsNew, importTarget, mergeImported, updateByDefault, type ImportRelation, type IncomingTrip } from '../lib/share';
+import { importedAsNew, importRelation, importTarget, mergeImported, updateByDefault, type ImportRelation, type IncomingTrip } from '../lib/share';
 import { tripSummary } from '../lib/tripOps';
 import { formatStamp } from '../lib/util';
 import { useStore } from '../store';
@@ -17,8 +17,8 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
   const trips = useStore((s) => s.trips);
   const ui = useUI();
   const target = importTarget(trips, incoming);
-  const relation = target ? compareImport(target.trip, incoming) : null;
-  const safe = !!target && !!relation && updateByDefault(target, relation);
+  const relation = target ? importRelation(target, incoming) : null;
+  const safe = !!target && !!relation && updateByDefault(target, relation, incoming);
   const [choice, setChoice] = useState<'update' | 'new'>(() => (safe ? 'update' : 'new'));
   const update = !!target && choice === 'update';
   const t = incoming.trip;
@@ -67,7 +67,7 @@ function ImportInner({ incoming }: { incoming: IncomingTrip }) {
             <div>
               <b>{target.match === 'name' ? '更新這台裝置上同名的行程' : '更新這台裝置上的這個行程'}</b>
               <div className="small muted">
-                「{target.trip.name}」 · {tripSummary(target.trip)}
+                「{target.trip.name}」 · {tripSummary(target.trip)} · {formatStamp(target.trip.updatedAt)} 修改
               </div>
               {target.match === 'name' && relation === 'unknown' && (
                 <div className="small warn">名稱相同，但可能是另一個行程，請先確認。</div>
@@ -102,7 +102,7 @@ const NOTES: Record<ImportRelation, { text: string; warn?: boolean }> = {
     text: '⚠️ 兩邊各自改過：這台裝置上有些修改不在匯入的版本裡，更新會失去這些修改。想兩份都留，請選「另存成新的行程」。',
     warn: true,
   },
-  unknown: { text: '更新後會換成匯入的內容。' },
+  unknown: { text: '無法判斷哪一份比較新；更新後，這台裝置上的內容會換成匯入的版本。' },
 };
 
 function RelationNote({ relation }: { relation: ImportRelation }) {
