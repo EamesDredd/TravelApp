@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { inProgress, locateKey, useLocateStatus } from '../lib/autoLocate';
 import { hasCoords } from '../lib/geo';
 import { useOnline } from '../lib/online';
-import { CATEGORIES, scheduledDays } from '../lib/tripOps';
+import { CATEGORIES, filterSpots, scheduledDays, type SpotFilter } from '../lib/tripOps';
 import { useCurrentTrip } from '../store';
 import type { Category } from '../types';
 import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
@@ -20,16 +20,18 @@ export function CandidatePool() {
   const locating = (id: string, name: string) => inProgress(statuses[locateKey(trip.id, { id, name })], online, paused);
 
   const count = (c: Category) => trip.spots.filter((s) => s.category === c).length;
-  const list = trip.spots
-    .filter((s) => cat === 'all' || s.category === cat)
-    .filter((s) => !q.trim() || s.name.toLowerCase().includes(q.trim().toLowerCase()))
-    .map((s) => ({ s, days: scheduledDays(trip, s.id) }))
-    .filter((x) => !onlyFree || x.days.length === 0);
+  const filter: SpotFilter = { category: cat, unscheduled: onlyFree, query: q };
+  const list = filterSpots(trip, filter).map((s) => ({ s, days: scheduledDays(trip, s.id) }));
 
   return (
     <section className="pool">
       <div className="pool-head">
         <h2>候選地點</h2>
+        {trip.spots.length > 0 && (
+          <button className="btn btn-sm" title="匯出到 Google 我的地圖" onClick={() => ui.openMyMapsExport(filter)}>
+            ⬇ 我的地圖
+          </button>
+        )}
         <button className="btn btn-sm btn-primary" onClick={() => ui.openAddSpot({ category: cat === 'all' ? undefined : cat })}>
           ＋ 新增
         </button>

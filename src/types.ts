@@ -12,6 +12,13 @@ export const CATEGORY_ICON: Record<Category, string> = {
   meal: '🍜',
 };
 
+/** Marker colours on the app's maps and in exported KML. */
+export const CATEGORY_COLOR: Record<Category, string> = {
+  sight: '#0f766e',
+  breakfast: '#b45309',
+  meal: '#be185d',
+};
+
 export interface SearchSource {
   title: string;
   url: string;

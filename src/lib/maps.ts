@@ -1,6 +1,7 @@
 import type { Day, LatLng, Spot, TravelMode, Trip } from '../types';
-import { CATEGORY_LABEL } from '../types';
+import { CATEGORY_COLOR, CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { hasCoords, wgsToGcj } from './geo';
+import { CATEGORIES, scheduledDays } from './tripOps';
 
 /** Text Google Maps can resolve: name plus address, or the trip destination as context. */
 export function placeQuery(spot: Spot, destination?: string): string {
@@ -243,6 +244,18 @@ function xml(s: string): string {
   return s.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]!);
 }
 
+/**
+ * A place's KML position. Google draws its street map of mainland China in GCJ-02, like Amap,
+ * so a GPS position there is shifted to land on the right street (and off the satellite photos).
+ */
+function kmlPoint(spot: Spot): string {
+  const g = wgsToGcj({ lat: spot.lat!, lng: spot.lng! });
+  return `${+g.lng.toFixed(6)},${+g.lat.toFixed(6)},0`;
+}
+
+/** '#rrggbb' in KML's aabbggrr order. */
+const kmlColor = (hex: string) => `ff${hex.slice(5, 7)}${hex.slice(3, 5)}${hex.slice(1, 3)}`;
+
 const DAY_COLORS = ['ff0f766e', 'ffd97706', 'ff2563eb', 'ffdb2777', 'ff7c3aed', 'ff16a34a', 'ffdc2626'];
 
 /**
@@ -263,13 +276,13 @@ export function tripToKml(trip: Trip, dayIndexes?: number[], dayLabel?: (i: numb
       const marks = stops
         .map(({ it, s }, n) => {
           const desc = [CATEGORY_LABEL[s!.category], it.time, s!.address, s!.note, it.note].filter(Boolean).join(' / ');
-          return `<Placemark><name>${n + 1}. ${xml(s!.name)}</name><description>${xml(desc)}</description><styleUrl>${style}</styleUrl><Point><coordinates>${s!.lng},${s!.lat},0</coordinates></Point></Placemark>`;
+          return `<Placemark><name>${n + 1}. ${xml(s!.name)}</name><description>${xml(desc)}</description><styleUrl>${style}</styleUrl><Point><coordinates>${kmlPoint(s!)}</coordinates></Point></Placemark>`;
         })
         .join('');
       const line =
         stops.length > 1
           ? `<Placemark><name>${xml(`第${i + 1}天路線`)}</name><styleUrl>${style}</styleUrl><LineString><tessellate>1</tessellate><coordinates>${stops
-              .map(({ s }) => `${s!.lng},${s!.lat},0`)
+              .map(({ s }) => kmlPoint(s!))
               .join(' ')}</coordinates></LineString></Placemark>`
           : '';
       const label = dayLabel ? dayLabel(i) : `第${i + 1}天`;
@@ -278,6 +291,32 @@ export function tripToKml(trip: Trip, dayIndexes?: number[], dayLabel?: (i: numb
     .join('');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${xml(trip.name)}</name>${styles}${folders}</Document></kml>
+`;
+}
+
+/**
+ * KML of places for Google My Maps: one folder per category, the category's icon before each
+ * name, and the days each place is on in its description. Places without coordinates are left out.
+ */
+export function spotsToKml(trip: Trip, spots: Spot[], title: string, dayLabel = (i: number) => `第${i + 1}天`): string {
+  const styles = CATEGORIES.map(
+    (c) => `<Style id="${c}"><IconStyle><color>${kmlColor(CATEGORY_COLOR[c])}</color></IconStyle></Style>`,
+  ).join('');
+  const folders = CATEGORIES.map((c) => {
+    const marks = spots
+      .filter((s) => s.category === c && hasCoords(s))
+      .map((s) => {
+        const days = scheduledDays(trip, s.id);
+        const desc = [CATEGORY_LABEL[c], days.length ? days.map(dayLabel).join('、') : '未排入', s.address, s.note]
+          .filter(Boolean)
+          .join(' / ');
+        return `<Placemark><name>${xml(`${CATEGORY_ICON[c]} ${s.name}`)}</name><description>${xml(desc)}</description><styleUrl>#${c}</styleUrl><Point><coordinates>${kmlPoint(s)}</coordinates></Point></Placemark>`;
+      })
+      .join('');
+    return marks ? `<Folder><name>${CATEGORY_LABEL[c]}</name>${marks}</Folder>` : '';
+  }).join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${xml(title)}</name>${styles}${folders}</Document></kml>
 `;
 }
 
