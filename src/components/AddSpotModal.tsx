@@ -10,14 +10,13 @@ import { CATEGORIES } from '../lib/tripOps';
 import { formatDayDate } from '../lib/util';
 import { useCurrentTrip, useStore } from '../store';
 import type { Category, LatLng, Spot, Trip } from '../types';
-import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
+import { CATEGORY_COLOR, CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { useUI } from '../ui';
 import type { MapPoint } from './LeafletMap';
 import { MapAppLink } from './MapAppLink';
 import { Modal } from './Modal';
 import { PasteModal } from './PasteModal';
 import { PickMap, type MapFocus } from './PickMap';
-import { CAT_COLOR } from './SpotMap';
 
 export function AddSpotModal() {
   const opts = useUI((s) => s.addSpot);
@@ -95,7 +94,7 @@ function AddSpotInner() {
     const located = (list: (Spot | undefined)[]) => list.filter((s): s is Spot & LatLng => !!s && s.id !== locating?.id && hasCoords(s));
     let near = located(day ? day.items.map((it) => byId.get(it.spotId)) : []);
     if (!near.length) near = located(trip.spots);
-    const pts: MapPoint[] = near.slice(0, 40).map((s) => ({ lat: s.lat, lng: s.lng, label: CATEGORY_ICON[s.category], title: s.name, color: CAT_COLOR[s.category] }));
+    const pts: MapPoint[] = near.slice(0, 40).map((s) => ({ lat: s.lat, lng: s.lng, label: CATEGORY_ICON[s.category], title: s.name, color: CATEGORY_COLOR[s.category] }));
     if (locating && hasCoords(locating)) pts.push({ lat: locating.lat, lng: locating.lng, label: '?', title: `${locating.name}（目前的位置）`, color: '#6b7280' });
     return pts;
   }, [trip, locating, opts.day]);

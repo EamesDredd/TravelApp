@@ -1,4 +1,5 @@
 import type { Category, Day, PlanItem, Spot, Trip, TripSnapshot } from '../types';
+import { CATEGORY_LABEL } from '../types';
 import { hasCoords } from './geo';
 import { formatDayDate, uid } from './util';
 
@@ -52,6 +53,30 @@ export function scheduledDays(trip: TripSnapshot, spotId: string): number[] {
     if (d.items.some((it) => it.spotId === spotId)) out.push(i);
   });
   return out;
+}
+
+/** What the candidates list shows: one category or all, only places on no day, a name search. */
+export interface SpotFilter {
+  category: Category | 'all';
+  unscheduled: boolean;
+  query: string;
+}
+
+export function filterSpots(trip: TripSnapshot, f: SpotFilter): Spot[] {
+  const q = f.query.trim().toLowerCase();
+  return trip.spots.filter(
+    (s) =>
+      (f.category === 'all' || s.category === f.category) &&
+      (!q || s.name.toLowerCase().includes(q)) &&
+      (!f.unscheduled || scheduledDays(trip, s.id).length === 0),
+  );
+}
+
+/** "午晚餐・未排入・「麵」", or '' when the filter lets every place through. */
+export function filterLabel(f: SpotFilter): string {
+  return [f.category !== 'all' && CATEGORY_LABEL[f.category], f.unscheduled && '未排入', f.query.trim() && `「${f.query.trim()}」`]
+    .filter(Boolean)
+    .join('・');
 }
 
 export function makeSpot(fields: Omit<Spot, 'id'>, existing: Spot[]): Spot {

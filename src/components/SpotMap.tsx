@@ -3,11 +3,9 @@ import { hasCoords, type ResolvedRegion } from '../lib/geo';
 import { amapPlaceLink, googleEmbedPlaceUrl, googleSearchLink } from '../lib/maps';
 import { useStore } from '../store';
 import type { Spot } from '../types';
-import { CATEGORY_ICON } from '../types';
+import { CATEGORY_COLOR, CATEGORY_ICON } from '../types';
 import { LeafletMap } from './LeafletMap';
 import { MapAppLink } from './MapAppLink';
-
-export const CAT_COLOR = { sight: '#0f766e', breakfast: '#b45309', meal: '#be185d' } as const;
 
 /** Small map for one place: Google Maps outside mainland China, Amap tiles inside. */
 export function SpotMap({ spot, region, destination }: { spot: Spot; region: ResolvedRegion; destination: string }) {
@@ -15,7 +13,7 @@ export function SpotMap({ spot, region, destination }: { spot: Spot; region: Res
   const points = useMemo(
     () =>
       hasCoords(spot)
-        ? [{ lat: spot.lat, lng: spot.lng, label: CATEGORY_ICON[spot.category], title: spot.name, color: CAT_COLOR[spot.category] }]
+        ? [{ lat: spot.lat, lng: spot.lng, label: CATEGORY_ICON[spot.category], title: spot.name, color: CATEGORY_COLOR[spot.category] }]
         : [],
     [spot],
   );

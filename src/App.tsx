@@ -5,6 +5,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { DayPlan } from './components/DayPlan';
 import { ExportPdfModal } from './components/ExportPdfModal';
 import { ImportTripModal } from './components/ImportTripModal';
+import { MyMapsExportModal } from './components/MyMapsExportModal';
 import { DayPickerModal, SpotPickerModal } from './components/Pickers';
 import { RouteModal } from './components/RouteModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -78,8 +79,9 @@ export default function App() {
       ) : (
         <Welcome />
       )}
-      {/* The route map opens place details and the locate dialog on top of itself. */}
+      {/* The route map and the My Maps export open place details and the locate dialog on top of themselves. */}
       <RouteModal />
+      <MyMapsExportModal />
       <SpotDetail />
       <AddSpotModal />
       <DayPickerModal />
