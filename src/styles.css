@@ -975,6 +975,22 @@ button.chip {
   background: var(--accent-soft);
 }
 
+/* A choice with a setting beside it (a place to add and its category). */
+.results .pick-row {
+  display: flex;
+  gap: 6px;
+}
+
+.results .pick-row button {
+  flex: 1;
+  min-width: 0;
+}
+
+.results .pick-row .select {
+  width: auto;
+  flex: none;
+}
+
 .wiki-hit {
   padding: 8px 0;
   border-top: 1px solid var(--border);

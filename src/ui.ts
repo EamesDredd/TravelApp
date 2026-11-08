@@ -27,8 +27,8 @@ interface UIState {
   pickDayFor: string | null;
   /** Export the itinerary as PDF; `day` preselects one day. */
   pdfExport: { day?: number } | null;
-  /** Export candidates for Google My Maps, offering the candidates list's current filter. */
-  myMapsExport: SpotFilter | null;
+  /** Move candidates to and from Google My Maps; export offers the candidates list's current filter. */
+  myMaps: SpotFilter | null;
   /** A shared or exported trip waiting for the user to choose: update the same trip here, or add it. */
   importing: IncomingTrip | null;
   toast: string | null;
@@ -40,7 +40,7 @@ interface UIState {
   openPickDay(spotId: string | null): void;
   openPickSpots(day: number | null): void;
   openPdfExport(v: UIState['pdfExport']): void;
-  openMyMapsExport(v: SpotFilter | null): void;
+  openMyMaps(v: SpotFilter | null): void;
   openImport(v: IncomingTrip | null): void;
   showToast(msg: string): void;
 }
@@ -56,7 +56,7 @@ export const useUI = create<UIState>()((set) => ({
   pickDayFor: null,
   pickSpotsForDay: null,
   pdfExport: null,
-  myMapsExport: null,
+  myMaps: null,
   importing: null,
   toast: null,
   openSpot: (spotId) => set({ spotId }),
@@ -67,7 +67,7 @@ export const useUI = create<UIState>()((set) => ({
   openPickDay: (pickDayFor) => set({ pickDayFor }),
   openPickSpots: (pickSpotsForDay) => set({ pickSpotsForDay }),
   openPdfExport: (pdfExport) => set({ pdfExport }),
-  openMyMapsExport: (myMapsExport) => set({ myMapsExport }),
+  openMyMaps: (myMaps) => set({ myMaps }),
   openImport: (importing) => set({ importing }),
   showToast: (toast) => {
     clearTimeout(toastTimer);
