@@ -28,8 +28,8 @@ export function CandidatePool() {
       <div className="pool-head">
         <h2>候選地點</h2>
         {trip.spots.length > 0 && (
-          <button className="btn btn-sm" title="匯出到 Google 我的地圖" onClick={() => ui.openMyMapsExport(filter)}>
-            ⬇ 我的地圖
+          <button className="btn btn-sm" title="匯出到 Google 我的地圖，或從我的地圖匯回" onClick={() => ui.openMyMaps(filter)}>
+            🗺 我的地圖
           </button>
         )}
         <button className="btn btn-sm btn-primary" onClick={() => ui.openAddSpot({ category: cat === 'all' ? undefined : cat })}>
