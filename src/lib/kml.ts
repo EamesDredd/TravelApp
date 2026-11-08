@@ -1,9 +1,9 @@
 /* Reading places back from a KML or KMZ file, such as a map exported from Google My Maps. */
-import type { Category, LatLng, Spot, TripSnapshot } from '../types';
+import type { Category, LatLng, PlanItem, Spot, TripSnapshot } from '../types';
 import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { distanceKm, gcjToWgs, hasCoords } from './geo';
 import { normName } from './placeMatch';
-import { CATEGORIES } from './tripOps';
+import { CATEGORIES, makeItem, makeSpot, newDay } from './tripOps';
 
 export interface KmlPlace {
   name: string;
@@ -164,6 +164,10 @@ export async function readKmlFile(file: Blob): Promise<KmlContent> {
 
 /** Moves shorter than this are rounding, not the user dragging the place. */
 const MOVED_KM = 0.005;
+/** Pins with one name this close are one place (put in two layers). */
+const SAME_PLACE_KM = 0.05;
+/** A layer named after a later day is about something else ("D100"). */
+const MAX_DAY = 60;
 
 export interface PlaceAdd {
   key: string;
@@ -180,6 +184,16 @@ export interface PlaceMove {
   km?: number;
 }
 
+/** A place on a day: one of the trip's (by id), or one the import adds (by its key). */
+export type DayStop = { spot: string } | { add: string };
+
+export interface DayLayer {
+  /** 0-based; may be past the trip's last day. */
+  day: number;
+  /** The layer's places, in its order. */
+  stops: DayStop[];
+}
+
 export interface KmlImportPlan {
   add: PlaceAdd[];
   move: PlaceMove[];
@@ -187,6 +201,52 @@ export interface KmlImportPlan {
   same: number;
   /** Located places of the trip the file does not have (perhaps deleted in My Maps). */
   absent: Spot[];
+  /** Layers named after a day (第1天, Day 1, D1): the places that day should have, in order. */
+  days: DayLayer[];
+}
+
+/** What the user chose in the preview. */
+export interface ImportChoice {
+  /** Additions (by key) and moves (by spot id) not to make. */
+  skip: ReadonlySet<string>;
+  /** Places missing from the file to delete. */
+  remove: ReadonlySet<string>;
+  /** Category picked for an addition, by key. */
+  categories: Readonly<Record<string, Category>>;
+  /** Day layers (0-based days) not to apply. */
+  skipDays: ReadonlySet<number>;
+}
+
+const DIGITS = '一二三四五六七八九';
+
+/** 1–99 in digits or Chinese numerals (三, 十二, 二十). */
+function numberIn(s: string): number | undefined {
+  if (/^\d+$/.test(s)) return Number(s);
+  const m = /^([一二三四五六七八九])?(十)?([一二三四五六七八九])?$/.exec(s);
+  if (!m || !s) return undefined;
+  if (!m[2]) return m[3] ? undefined : DIGITS.indexOf(m[1]!) + 1;
+  return (m[1] ? DIGITS.indexOf(m[1]) + 1 : 1) * 10 + (m[3] ? DIGITS.indexOf(m[3]) + 1 : 0);
+}
+
+/** The day (0-based) a layer is named after: 第1天, 第一天, Day 1, D1, or a day's export 「上海-第1天」. */
+export function dayOfLayer(name: string | undefined): number | undefined {
+  if (!name) return undefined;
+  const s = name.normalize('NFKC');
+  const n =
+    /第\s*([0-9]+|[一二三四五六七八九十]+)\s*[天日]/.exec(s)?.[1] ??
+    /\bday\s*0*([0-9]+)(?![0-9])/i.exec(s)?.[1] ??
+    /(?:^|[\s\-_/|·・,，、(（[【])d0*([0-9]+)(?![0-9a-z])/i.exec(s)?.[1];
+  const day = n === undefined ? undefined : numberIn(n);
+  return day && day <= MAX_DAY ? day - 1 : undefined;
+}
+
+/** The category a layer's name suggests (「早餐」, anything about eating, 「景點」). */
+export function layerCategory(name: string | undefined): Category | undefined {
+  const n = name?.toLowerCase() ?? '';
+  if (/早餐|早午餐|breakfast|brunch/.test(n)) return 'breakfast';
+  if (/餐|吃|食|麵|咖啡|甜點|甜点|restaurant|food|lunch|dinner|eat|cafe|café/.test(n)) return 'meal';
+  if (/景點|景点|觀光|观光|sight|attraction/.test(n)) return 'sight';
+  return undefined;
 }
 
 const byLabel = (label: string | undefined) => CATEGORIES.find((c) => CATEGORY_LABEL[c] === label?.trim());
@@ -216,44 +276,134 @@ function readDescription(text: string | undefined): { category?: Category; note?
 
 /**
  * What importing a file into a trip would do. Places are matched to the trip's by name (ignoring
- * the icon, a 「1. 」 numbering from a day's export, spaces and traditional/simplified differences).
+ * the icon, a 「1. 」 numbering from a day's export, spaces and traditional/simplified differences);
+ * a place may be in several layers (days).
  */
 export function planKmlImport(trip: TripSnapshot, content: KmlContent): KmlImportPlan {
-  const unclaimed = new Map<string, Spot[]>();
+  const byName = new Map<string, Spot[]>();
   for (const s of trip.spots) {
     const k = normName(s.name);
-    unclaimed.set(k, [...(unclaimed.get(k) ?? []), s]);
+    byName.set(k, [...(byName.get(k) ?? []), s]);
   }
-  const claim = (name: string) => {
-    const list = unclaimed.get(normName(name));
-    return list?.length ? list.shift() : undefined;
+  const seen = new Set<string>();
+  const away = (s: Spot, at: LatLng) => (hasCoords(s) ? distanceKm(s, at) : Infinity);
+  /** The trip's place with this name: one not matched yet if there is one, the nearest of several. */
+  const find = (name: string, at: LatLng) => {
+    const list = byName.get(normName(name));
+    if (!list?.length) return undefined;
+    const fresh = list.filter((s) => !seen.has(s.id));
+    return (fresh.length ? fresh : list).reduce((a, b) => (away(b, at) < away(a, at) ? b : a));
   };
 
-  const plan: KmlImportPlan = { add: [], move: [], same: 0, absent: [] };
-  const claimed = new Set<string>();
+  const plan: KmlImportPlan = { add: [], move: [], same: 0, absent: [], days: [] };
+  const layers = new Map<number, DayStop[]>();
   content.places.forEach((p, i) => {
     const { name, category: iconCategory } = splitName(p.name);
+    const day = dayOfLayer(p.folder);
     const numbered = /^\d+\.\s*(.+)$/.exec(name)?.[1];
-    const spot = name ? (claim(name) ?? (numbered ? claim(numbered) : undefined)) : undefined;
+    const spot = name ? (find(name, p.at) ?? (numbered ? find(numbered, p.at) : undefined)) : undefined;
+    let stop: DayStop;
     if (spot) {
-      claimed.add(spot.id);
-      const km = hasCoords(spot) ? distanceKm(spot, p.at) : undefined;
-      if (km !== undefined && km < MOVED_KM) plan.same++;
-      else plan.move.push({ spot, at: p.at, ...(km !== undefined ? { km } : {}) });
-      return;
+      if (!seen.has(spot.id)) {
+        seen.add(spot.id);
+        const km = hasCoords(spot) ? distanceKm(spot, p.at) : undefined;
+        if (km !== undefined && km < MOVED_KM) plan.same++;
+        else plan.move.push({ spot, at: p.at, ...(km !== undefined ? { km } : {}) });
+      }
+      stop = { spot: spot.id };
+    } else {
+      const label = (day !== undefined && numbered) || name || p.description?.split('\n')[0].slice(0, 40) || '未命名地點';
+      const twin = plan.add.find((a) => normName(a.name) === normName(label) && distanceKm(a.at, p.at) < SAME_PLACE_KM);
+      if (twin) stop = { add: twin.key };
+      else {
+        const desc = readDescription(p.description);
+        plan.add.push({
+          key: `a${i}`,
+          name: label,
+          category: iconCategory ?? desc.category ?? layerCategory(p.folder) ?? 'sight',
+          at: p.at,
+          ...(desc.note && desc.note !== label ? { note: desc.note } : {}),
+        });
+        stop = { add: `a${i}` };
+      }
     }
-    const label = name || p.description?.split('\n')[0].slice(0, 40) || '未命名地點';
-    // The same place twice in the file (two layers, or exported twice): keep one.
-    if (plan.add.some((a) => normName(a.name) === normName(label) && distanceKm(a.at, p.at) < MOVED_KM)) return;
-    const desc = readDescription(p.description);
-    plan.add.push({
-      key: `a${i}`,
-      name: label,
-      category: iconCategory ?? desc.category ?? byLabel(p.folder) ?? 'sight',
-      at: p.at,
-      ...(desc.note && desc.note !== label ? { note: desc.note } : {}),
-    });
+    if (day !== undefined) layers.set(day, [...(layers.get(day) ?? []), stop]);
   });
-  plan.absent = trip.spots.filter((s) => hasCoords(s) && !claimed.has(s.id));
+  plan.absent = trip.spots.filter((s) => hasCoords(s) && !seen.has(s.id));
+  plan.days = [...layers].sort(([a], [b]) => a - b).map(([day, stops]) => ({ day, stops }));
   return plan;
+}
+
+/** A day's items in a layer's order: existing items reused (with their times and notes), pinned ones left in place. */
+function arrange(items: PlanItem[], ids: string[], pinned: (it: PlanItem) => boolean): PlanItem[] {
+  const pool = new Map<string, PlanItem[]>();
+  for (const it of items) if (!pinned(it)) pool.set(it.spotId, [...(pool.get(it.spotId) ?? []), it]);
+  const out = ids.map((id) => pool.get(id)?.shift() ?? makeItem(id));
+  items.forEach((it, i) => {
+    if (pinned(it)) out.splice(Math.min(i, out.length), 0, it);
+  });
+  return out;
+}
+
+/**
+ * The trip after an import, as chosen: positions updated, places added and deleted, and each day
+ * layer's places on its day in the layer's order. A day keeps, where they were, the places that had
+ * no position (they could not be on the map).
+ */
+export function applyKmlImport(trip: TripSnapshot, plan: KmlImportPlan, choice: ImportChoice): TripSnapshot {
+  const moved = new Map(plan.move.filter((m) => !choice.skip.has(m.spot.id)).map((m) => [m.spot.id, m.at]));
+  const spots: Spot[] = trip.spots
+    .filter((s) => !choice.remove.has(s.id))
+    .map((s) => {
+      const at = moved.get(s.id);
+      return at ? { ...s, lat: at.lat, lng: at.lng, geo: 'manual' as const } : s;
+    });
+  const added = new Map<string, string>();
+  for (const a of plan.add) {
+    if (choice.skip.has(a.key)) continue;
+    const category = choice.categories[a.key] ?? a.category;
+    const spot = makeSpot({ name: a.name, category, lat: a.at.lat, lng: a.at.lng, geo: 'manual', ...(a.note ? { note: a.note } : {}) }, spots);
+    spots.push(spot);
+    added.set(a.key, spot.id);
+  }
+  const kept = new Set(spots.map((s) => s.id));
+  const mapped = new Set(trip.spots.filter(hasCoords).map((s) => s.id));
+  const days = trip.days.map((d) => ({ ...d, items: d.items.filter((it) => kept.has(it.spotId)) }));
+  for (const layer of plan.days) {
+    if (choice.skipDays.has(layer.day)) continue;
+    const ids = layer.stops.map((s) => ('spot' in s ? s.spot : added.get(s.add))).filter((id): id is string => !!id && kept.has(id));
+    while (days.length <= layer.day) days.push(newDay());
+    const d = days[layer.day];
+    days[layer.day] = { ...d, items: arrange(d.items, ids, (it) => !mapped.has(it.spotId) && !ids.includes(it.spotId)) };
+  }
+  return { name: trip.name, destination: trip.destination, startDate: trip.startDate, spots, days };
+}
+
+export interface DayChange {
+  day: number;
+  /** Past the trip's last day: applying it adds days. */
+  extra: boolean;
+  /** The day's places afterwards, and whether each is new on that day. */
+  stops: { name: string; added: boolean }[];
+  /** Places taken off the day. */
+  removed: string[];
+}
+
+/** How each day layer would change its day (days it would leave as they are are left out). */
+export function dayChanges(trip: TripSnapshot, plan: KmlImportPlan, choice: ImportChoice): DayChange[] {
+  const after = applyKmlImport(trip, plan, { ...choice, skipDays: new Set() });
+  const names = new Map([...trip.spots, ...after.spots].map((s) => [s.id, s.name]));
+  return plan.days.flatMap(({ day }) => {
+    const before = trip.days[day]?.items.map((it) => it.spotId) ?? [];
+    const now = after.days[day].items.map((it) => it.spotId);
+    if (before.join() === now.join()) return [];
+    return [
+      {
+        day,
+        extra: day >= trip.days.length,
+        stops: now.map((id) => ({ name: names.get(id) ?? '', added: !before.includes(id) })),
+        removed: before.filter((id) => !now.includes(id)).map((id) => names.get(id) ?? ''),
+      },
+    ];
+  });
 }

@@ -227,9 +227,14 @@ function ImportFromMyMaps({ onRead }: { onRead(file: string, content: KmlContent
           {error}
         </div>
       )}
-      <p className="hint" style={{ marginTop: 10 }}>
-        地點用名稱對應，在我的地圖改過名稱的會當成新地點。路線、線條和形狀不會匯入，每天的行程安排也不會改變。
-      </p>
+      <ul className="hint" style={{ marginTop: 10, paddingLeft: 18 }}>
+        <li>地點用名稱對應，在我的地圖改過名稱的會當成新地點。路線、線條和形狀不會匯入。</li>
+        <li>
+          圖層名稱像「第1天」「Day 1」「D1」的，地點會照圖層裡的順序排進那一天。想在我的地圖分天安排，可以每天建立一個圖層；也可以把「🗺
+          路線地圖」下載的當天 KML 各匯入成一個圖層。
+        </li>
+        <li>圖層名稱有「早餐」，或「餐」「吃」「美食」「景點」等字的，新地點會歸到對應的類別。</li>
+      </ul>
     </>
   );
 }

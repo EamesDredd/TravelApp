@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { distanceKm, wgsToGcj } from '../geo';
-import { KmlError, parseKml, planKmlImport, readKmlFile } from '../kml';
-import { spotsToKml } from '../maps';
+import { applyKmlImport, dayChanges, dayOfLayer, KmlError, layerCategory, parseKml, planKmlImport, readKmlFile, type ImportChoice } from '../kml';
+import { spotsToKml, tripToKml } from '../maps';
 import { newTrip } from '../tripOps';
 import type { Spot } from '../../types';
 
@@ -98,7 +98,7 @@ describe('planKmlImport', () => {
 
   it('changes nothing when the exported map comes back as it was', () => {
     const plan = planKmlImport(trip, parseKml(spotsToKml(trip, trip.spots, '上海')));
-    expect(plan).toEqual({ add: [], move: [], same: 4, absent: [] });
+    expect(plan).toEqual({ add: [], move: [], same: 4, absent: [], days: [] });
   });
 
   it('finds added, moved, newly located and missing places', () => {
@@ -130,3 +130,111 @@ describe('planKmlImport', () => {
     expect(plan.absent.map((s) => s.id)).toEqual(['s_1', 's_5']);
   });
 });
+
+describe('layer names', () => {
+  it('finds the day a layer is for', () => {
+    const days = ['第1天', '第一天', '第十二天', '第 2 日', '上海五日遊-第3天', '第2天 10/25（日） 外灘一帶', 'Day 4', 'day04', 'D5', 'D1 外灘', '【D2】美食'];
+    expect(days.map(dayOfLayer)).toEqual([0, 0, 11, 1, 2, 1, 3, 3, 4, 0, 1]);
+    for (const other of ['景點', 'Food2', 'Sunday 1', 'D100', '2D3N', '第0天', undefined]) expect(dayOfLayer(other)).toBeUndefined();
+  });
+
+  it('suggests a category', () => {
+    const names = ['早餐', '午晚餐', '必吃', '美食清單', '咖啡廳', 'Restaurants', '景點', '飯店', '住宿'];
+    expect(names.map(layerCategory)).toEqual(['breakfast', 'meal', 'meal', 'meal', 'meal', 'meal', 'sight', undefined, undefined]);
+  });
+});
+
+describe('day layers', () => {
+  const A = { id: 'A', name: '外灘', category: 'sight', lat: 31.24, lng: 121.49 } satisfies Spot;
+  const B = { id: 'B', name: '豫園', category: 'sight', lat: 31.2272, lng: 121.4921 } satisfies Spot;
+  const C = { id: 'C', name: '新天地', category: 'sight', lat: 31.2196, lng: 121.4733 } satisfies Spot;
+  const L: Spot = { id: 'L', name: '午餐（附近找）', category: 'meal' };
+  const H = { id: 'H', name: '酒店', category: 'sight', lat: 31.24569, lng: 121.4111 } satisfies Spot;
+  const make = () => {
+    const trip = newTrip({ name: '上海', destination: '上海', dayCount: 2 });
+    trip.spots = [A, B, C, L, H];
+    trip.days[0].items = [
+      { id: 'i1', spotId: 'A', time: '09:00' },
+      { id: 'i2', spotId: 'L' },
+      { id: 'i3', spotId: 'B' },
+      { id: 'i4', spotId: 'C', note: '晚上' },
+    ];
+    trip.days[1].items = [{ id: 'i5', spotId: 'H' }];
+    return trip;
+  };
+  const pin = (name: string, s: { lat: number; lng: number }) =>
+    `<Placemark><name>${name}</name><Point><coordinates>${gcj(s.lat, s.lng)}</coordinates></Point></Placemark>`;
+  const none: ImportChoice = { skip: new Set(), remove: new Set(), categories: {}, skipDays: new Set() };
+
+  it('puts each day layer’s places on its day, in order, keeping what the map could not show', () => {
+    const trip = make();
+    const kml = `<kml><Document>
+      <Folder><name>第1天</name>${pin('新天地', C)}${pin('1. 外灘', A)}${pin('2. 田子坊', { lat: 31.2087, lng: 121.4689 })}</Folder>
+      <Folder><name>第3天</name>${pin('酒店', H)}${pin('田子坊', { lat: 31.2087, lng: 121.4689 })}</Folder>
+      <Folder><name>想去</name>${pin('朱家角', { lat: 31.1074, lng: 121.0548 })}</Folder>
+    </Document></kml>`;
+    const plan = planKmlImport(trip, parseKml(kml));
+    expect(plan.add.map((a) => [a.key, a.name])).toEqual([
+      ['a2', '田子坊'],
+      ['a5', '朱家角'],
+    ]);
+    expect(plan.days).toEqual([
+      { day: 0, stops: [{ spot: 'C' }, { spot: 'A' }, { add: 'a2' }] },
+      { day: 2, stops: [{ spot: 'H' }, { add: 'a2' }] },
+    ]);
+    expect(plan.same).toBe(3);
+    expect(plan.absent.map((s) => s.id)).toEqual(['B']);
+
+    const after = applyKmlImport(trip, plan, none);
+    const tianzifang = after.spots.find((s) => s.name === '田子坊')!;
+    expect(after.days[0].items).toEqual([
+      { id: 'i4', spotId: 'C', note: '晚上' },
+      { id: 'i2', spotId: 'L' },
+      { id: 'i1', spotId: 'A', time: '09:00' },
+      { id: expect.any(String), spotId: tianzifang.id },
+    ]);
+    // A day without a layer is left alone; a later day is added.
+    expect(after.days[1].items).toEqual([{ id: 'i5', spotId: 'H' }]);
+    expect(after.days).toHaveLength(3);
+    expect(after.days[2].items.map((it) => it.spotId)).toEqual(['H', tianzifang.id]);
+    expect(after.spots.map((s) => s.name)).toEqual(['外灘', '豫園', '新天地', '午餐（附近找）', '酒店', '田子坊', '朱家角']);
+
+    expect(dayChanges(trip, plan, none)).toEqual([
+      {
+        day: 0,
+        extra: false,
+        stops: [
+          { name: '新天地', added: false },
+          { name: '午餐（附近找）', added: false },
+          { name: '外灘', added: false },
+          { name: '田子坊', added: true },
+        ],
+        removed: ['豫園'],
+      },
+      { day: 2, extra: true, stops: [{ name: '酒店', added: true }, { name: '田子坊', added: true }], removed: [] },
+    ]);
+  });
+
+  it('follows the choices', () => {
+    const trip = make();
+    const kml = `<kml><Document><Folder><name>第1天</name>${pin('新天地', C)}${pin('田子坊', { lat: 31.2087, lng: 121.4689 })}</Folder></Document></kml>`;
+    const plan = planKmlImport(trip, parseKml(kml));
+    const skipped = applyKmlImport(trip, plan, { ...none, skip: new Set(['a1']), remove: new Set(['A']) });
+    expect(skipped.spots.map((s) => s.id)).toEqual(['B', 'C', 'L', 'H']);
+    expect(skipped.days[0].items.map((it) => it.spotId)).toEqual(['L', 'C']);
+    const dayKept = applyKmlImport(trip, plan, { ...none, skipDays: new Set([0]) });
+    expect(dayKept.days[0]).toEqual(trip.days[0]);
+    expect(dayKept.spots.find((s) => s.name === '田子坊')?.category).toBe('sight');
+  });
+
+  it('changes nothing when an exported day comes back as it was', () => {
+    const trip = make();
+    trip.days[1].items = [{ id: 'i5', spotId: 'H' }, { id: 'i6', spotId: 'B' }, { id: 'i7', spotId: 'H' }];
+    const plan = planKmlImport(trip, parseKml(tripToKml(trip)));
+    expect(plan.add).toEqual([]);
+    expect(plan.move).toEqual([]);
+    expect(dayChanges(trip, plan, none)).toEqual([]);
+    expect(applyKmlImport(trip, plan, none).days).toEqual(trip.days);
+  });
+});
+

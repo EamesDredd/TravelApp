@@ -1,12 +1,19 @@
 import { useMemo, useState } from 'react';
 import { formatKm } from '../lib/geo';
-import { planKmlImport, type KmlContent } from '../lib/kml';
+import { applyKmlImport, dayChanges, planKmlImport, type ImportChoice, type KmlContent } from '../lib/kml';
 import { CATEGORIES, scheduledDays } from '../lib/tripOps';
+import { formatDayDate } from '../lib/util';
 import { useCurrentTrip, useStore } from '../store';
 import type { Category } from '../types';
 import { CATEGORY_ICON, CATEGORY_LABEL } from '../types';
 import { useUI } from '../ui';
 import { Modal } from './Modal';
+
+function toggled<T>(set: ReadonlySet<T>, key: T): ReadonlySet<T> {
+  const next = new Set(set);
+  if (!next.delete(key)) next.add(key);
+  return next;
+}
 
 /** The changes a My Maps file would make to the open trip, to choose from before applying them. */
 export function KmlImportModal({
@@ -23,43 +30,38 @@ export function KmlImportModal({
   const trip = useCurrentTrip()!;
   const ui = useUI();
   const plan = useMemo(() => planKmlImport(trip, content), [trip, content]);
-  // Additions and moves are applied unless unticked; places missing from the file are kept unless ticked.
-  const [skipped, setSkipped] = useState<ReadonlySet<string>>(new Set());
-  const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set());
+  // Additions, moves and days are applied unless unticked; deletions and days past the trip's last only when ticked.
+  const [skip, setSkip] = useState<ReadonlySet<string>>(new Set());
+  const [remove, setRemove] = useState<ReadonlySet<string>>(new Set());
   const [categories, setCategories] = useState<Record<string, Category>>({});
-  const toggle = (set: (f: (s: ReadonlySet<string>) => ReadonlySet<string>) => void, key: string) =>
-    set((s) => {
-      const next = new Set(s);
-      if (!next.delete(key)) next.add(key);
-      return next;
-    });
+  const [skipDays, setSkipDays] = useState<ReadonlySet<number>>(
+    () => new Set(plan.days.filter((d) => d.day >= trip.days.length).map((d) => d.day)),
+  );
+  const choice: ImportChoice = { skip, remove, categories, skipDays };
+  const days = useMemo(() => dayChanges(trip, plan, { skip, remove, categories, skipDays }), [trip, plan, skip, remove, categories, skipDays]);
 
-  const adds = plan.add.filter((a) => !skipped.has(a.key));
-  const moves = plan.move.filter((m) => !skipped.has(m.spot.id));
-  const removes = plan.absent.filter((s) => removed.has(s.id));
-  const changes = adds.length + moves.length + removes.length;
-  const nothing = !plan.add.length && !plan.move.length && !plan.absent.length;
+  const counts = {
+    add: plan.add.filter((a) => !skip.has(a.key)).length,
+    move: plan.move.filter((m) => !skip.has(m.spot.id)).length,
+    remove: plan.absent.filter((s) => remove.has(s.id)).length,
+    days: days.filter((d) => !skipDays.has(d.day)).length,
+  };
+  const changes = counts.add + counts.move + counts.remove + counts.days;
+  const nothing = !plan.add.length && !plan.move.length && !plan.absent.length && !days.length;
 
   const apply = () => {
-    const st = useStore.getState();
-    for (const a of adds) {
-      st.addSpot({
-        name: a.name,
-        category: categories[a.key] ?? a.category,
-        lat: a.at.lat,
-        lng: a.at.lng,
-        geo: 'manual',
-        ...(a.note ? { note: a.note } : {}),
-      });
-    }
-    for (const m of moves) st.updateSpot(m.spot.id, { lat: m.at.lat, lng: m.at.lng, geo: 'manual' });
-    for (const s of removes) st.removeSpot(s.id);
-    const done = [adds.length && `新增 ${adds.length}`, moves.length && `更新 ${moves.length}`, removes.length && `刪除 ${removes.length}`];
+    useStore.getState().replaceSnapshot(applyKmlImport(trip, plan, choice));
+    const done = [
+      counts.add && `新增 ${counts.add}`,
+      counts.move && `更新 ${counts.move}`,
+      counts.remove && `刪除 ${counts.remove}`,
+      counts.days && `調整 ${counts.days} 天的行程`,
+    ];
     ui.showToast(`已從我的地圖匯入：${done.filter(Boolean).join('、')}`);
     onDone();
   };
 
-  const days = (id: string) => {
+  const scheduled = (id: string) => {
     const d = scheduledDays(trip, id);
     return d.length ? `已排入 ${d.map((i) => `第${i + 1}天`).join('、')}` : '未排入';
   };
@@ -93,10 +95,10 @@ export function KmlImportModal({
           <h3>新增 {plan.add.length} 個候選地點</h3>
           <ul className="results">
             {plan.add.map((a) => {
-              const on = !skipped.has(a.key);
+              const on = !skip.has(a.key);
               return (
                 <li key={a.key} className="pick-row">
-                  <button className={on ? 'on' : ''} onClick={() => toggle(setSkipped, a.key)}>
+                  <button className={on ? 'on' : ''} onClick={() => setSkip((s) => toggled(s, a.key))}>
                     <span className="row">
                       <span>{on ? '☑' : '☐'}</span>
                       <span className="grow">
@@ -129,16 +131,55 @@ export function KmlImportModal({
           <h3>更新 {plan.move.length} 個地點的位置</h3>
           <ul className="results">
             {plan.move.map((m) => {
-              const on = !skipped.has(m.spot.id);
+              const on = !skip.has(m.spot.id);
               return (
                 <li key={m.spot.id}>
-                  <button className={on ? 'on' : ''} onClick={() => toggle(setSkipped, m.spot.id)}>
+                  <button className={on ? 'on' : ''} onClick={() => setSkip((s) => toggled(s, m.spot.id))}>
                     <span className="row">
                       <span>{on ? '☑' : '☐'}</span>
                       <span className={`cat-dot cat-${m.spot.category}`}>{CATEGORY_ICON[m.spot.category]}</span>
                       <span className="grow">
                         <b>{m.spot.name}</b>
                         <div className="small muted">{m.km === undefined ? '原本沒有座標' : `移動了約 ${formatKm(m.km)}`}</div>
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+
+      {days.length > 0 && (
+        <>
+          <h3>調整 {days.length} 天的行程</h3>
+          <p className="hint" style={{ marginBottom: 6 }}>
+            依「第1天」「Day 1」這類名稱的圖層，把地點照圖層裡的順序排進那一天。
+          </p>
+          <ul className="results">
+            {days.map((d) => {
+              const on = !skipDays.has(d.day);
+              return (
+                <li key={d.day}>
+                  <button className={on ? 'on' : ''} onClick={() => setSkipDays((s) => toggled(s, d.day))}>
+                    <span className="row" style={{ alignItems: 'flex-start' }}>
+                      <span>{on ? '☑' : '☐'}</span>
+                      <span className="grow">
+                        <b>
+                          第{d.day + 1}天 {formatDayDate(trip.startDate, d.day)}
+                        </b>
+                        {d.extra && <div className="small muted">行程目前只有 {trip.days.length} 天，勾選會增加天數</div>}
+                        <div className="small">
+                          {d.stops.map((s, i) => (
+                            <span key={i}>
+                              {i > 0 && ' → '}
+                              {s.added ? <b style={{ color: 'var(--accent)' }}>＋{s.name}</b> : s.name}
+                            </span>
+                          ))}
+                          {!d.stops.length && '（沒有地點）'}
+                        </div>
+                        {d.removed.length > 0 && <div className="small muted">移出這天：{d.removed.join('、')}</div>}
                       </span>
                     </span>
                   </button>
@@ -157,10 +198,10 @@ export function KmlImportModal({
           </p>
           <ul className="results">
             {plan.absent.map((s) => {
-              const on = removed.has(s.id);
+              const on = remove.has(s.id);
               return (
                 <li key={s.id}>
-                  <button className={on ? 'on' : ''} onClick={() => toggle(setRemoved, s.id)}>
+                  <button className={on ? 'on' : ''} onClick={() => setRemove((r) => toggled(r, s.id))}>
                     <span className="row">
                       <span>{on ? '☑' : '☐'}</span>
                       <span className={`cat-dot cat-${s.category}`}>{CATEGORY_ICON[s.category]}</span>
@@ -168,7 +209,7 @@ export function KmlImportModal({
                         <b>{s.name}</b>
                         <div className="small muted">
                           {on ? '會刪除 · ' : ''}
-                          {days(s.id)}
+                          {scheduled(s.id)}
                         </div>
                       </span>
                     </span>
